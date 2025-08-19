@@ -56,30 +56,51 @@ static __global__ void fill_ones(float *x, int n) {
 // Uses warp-level reduction for efficiency
 // Uses shared memory to store per-warp results
 
-static __global__ void Stats(float *d_stage, int n, int *mask, double *d_mean,
-                             double *d_var, int *d_count, int *finish) {
+// need to make sure there is at least a full warp
+
+static __global__ void Stats(float *d_stage, int n, int m, int *mask,
+                             double *d_mean, double *d_var, int *d_count,
+                             int *finish) {
 
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
+  int i = blockIdx.y * blockDim.y;
   int wid = threadIdx.x / 32;  // warp ID
   int lane = threadIdx.x % 32; // lane ID within the warp
   double sum = 0.0, sum2 = 0.0;
   int cnt = 0;
+  bool active = tid < m && i < n;
 
-  if (tid >= n)
-    return; // Out of bounds
-
+  // if (tid >= n)
+  //  return; // Out of bounds
   // 1) compute local sums and sums of squares
+  if (active) {
 
-  if (mask[tid]) {
+    d_stage = d_stage + i * (size_t)m;
+    mask = mask + i * (size_t)m;
+    d_mean = d_mean + i;
+    d_var = d_var + i;
+    d_count = d_count + i;
+    finish = finish + i;
+    active = active && (*finish == 0);
 
-    float v = d_stage[tid];
-    sum += v;
-    sum2 += double(v) * double(v);
-    cnt++;
+    if (mask[tid] && *finish == 0) {
+
+      float v = d_stage[tid];
+      sum += v;
+      sum2 += double(v) * double(v);
+      cnt++;
+    }
   }
   __syncthreads();
 
+  extern __shared__ double ws[100];
+  int warps_per_block = (blockDim.x + warpSize - 1) / warpSize;
+  double *warp_sum = ws;
+  double *warp_sum2 = ws + warps_per_block;
+  int *warp_cnt = (int *)(ws + 2 * warps_per_block);
+
   // 2) warp-level reduction
+
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
     sum += __shfl_down_sync(-1, sum, offset);
     sum2 += __shfl_down_sync(-1, sum2, offset);
@@ -87,21 +108,17 @@ static __global__ void Stats(float *d_stage, int n, int *mask, double *d_mean,
   }
 
   // Shared memory to store per-warp results
-  extern __shared__ double ws[100];
-  int warps_per_block = (blockDim.x + warpSize - 1) / warpSize;
-  double *warp_sum = ws;
-  double *warp_sum2 = ws + warps_per_block;
-  int *warp_cnt = (int *)(ws + 2 * warps_per_block);
 
-  if (lane == 0) {
+  if (active && lane == 0) {
     warp_sum[wid] = sum;
     warp_sum2[wid] = sum2;
     warp_cnt[wid] = cnt;
   }
+
   __syncthreads();
 
   // 3) block-level reduction in first warp
-  if (wid == 0) {
+  if (active && wid == 0) {
     sum = 0.0;
     sum2 = 0.0;
     cnt = 0;
@@ -123,7 +140,7 @@ static __global__ void Stats(float *d_stage, int n, int *mask, double *d_mean,
       atomicAdd(d_count, cnt);
     }
   }
-}
+} // namespace astroaccelerate
 
 static __global__ void GlobStats(double *d_stage, int n, int *mask,
                                  double *d_mean, double *d_var, int *d_count) {
@@ -133,14 +150,12 @@ static __global__ void GlobStats(double *d_stage, int n, int *mask,
   int lane = threadIdx.x % 32; // lane ID within the warp
   double sum = 0.0, sum2 = 0.0;
   int cnt = 0;
-
-  if (tid >= n)
-    return; // Out of bounds
+  bool active = tid < n;
 
   // 1) compute local sums and sums of squares
 
-  if (mask[tid]) {
-    float v = d_stage[tid];
+  if (active && mask[tid]) {
+    double v = d_stage[tid];
     sum += v;
     sum2 += double(v) * double(v);
     cnt++;
@@ -161,7 +176,7 @@ static __global__ void GlobStats(double *d_stage, int n, int *mask,
   double *warp_sum2 = ws + warps_per_block;
   int *warp_cnt = (int *)(ws + 2 * warps_per_block);
 
-  if (lane == 0) {
+  if (active && lane == 0) {
     warp_sum[wid] = sum;
     warp_sum2[wid] = sum2;
     warp_cnt[wid] = cnt;
@@ -169,90 +184,108 @@ static __global__ void GlobStats(double *d_stage, int n, int *mask,
   __syncthreads();
 
   // 3) block-level reduction in first warp
-  if (wid == 0) {
-    sum = 0.0;
-    sum2 = 0.0;
-    cnt = 0;
-    if (lane < warps_per_block) {
-      sum = warp_sum[lane];
-      sum2 = warp_sum2[lane];
-      cnt = warp_cnt[lane];
-    }
-    // final warp reduce
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-      sum += __shfl_down_sync(-1, sum, offset);
-      sum2 += __shfl_down_sync(-1, sum2, offset);
-      cnt += __shfl_down_sync(-1, cnt, offset);
-    }
-    // Add up all the sum and sum2 and cnt to global memory
-    if (lane == 0) {
-      atomicAdd(d_mean, sum);
-      atomicAdd(d_var, sum2);
-      atomicAdd(d_count, cnt);
-    }
-    __syncthreads();
+  sum = 0.0;
+  sum2 = 0.0;
+  cnt = 0;
+  if (active && wid == 0 && lane < warps_per_block) {
+    sum = warp_sum[lane];
+    sum2 = warp_sum2[lane];
+    cnt = warp_cnt[lane];
   }
-}
+  // final warp reduce
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(-1, sum, offset);
+    sum2 += __shfl_down_sync(-1, sum2, offset);
+    cnt += __shfl_down_sync(-1, cnt, offset);
+  }
+  // Add up all the sum and sum2 and cnt to global memory
+  if (active && wid == 0 && lane == 0) {
+    atomicAdd(d_mean, sum);
+    atomicAdd(d_var, sum2);
+    atomicAdd(d_count, cnt);
+  }
+} // namespace astroaccelerate
 
-static __global__ void Calc(double *d_mean, double *d_var, int *count) {
-  if (*count == 0) {
-    return;
+static __global__ void Calc(double *d_mean, double *d_var, int *count, int n) {
+  int tid = threadIdx.x + blockDim.x * blockIdx.x;
+  bool active = tid < n;
+  if (active && count[tid] != 0) {
+    d_mean[tid] /= count[tid];
+    d_var[tid] = d_var[tid] / count[tid] - (d_mean[tid] * d_mean[tid]);
+    d_var[tid] = sqrt(d_var[tid]);
   }
-  *d_mean /= *count;
-  *d_var = *d_var / *count - (*d_mean * *d_mean);
-  *d_var = sqrt(*d_var);
 } // end of Calc
 
 // finish & count check at host
-static __global__ void SigmaClip(float *d_stage, int n, int *mask1, int *mask2,
-                                 double *d_mean, double *d_var,
+static __global__ void SigmaClip(float *d_stage, int n, int m, int *mask1,
+                                 int *mask2, double *d_mean, double *d_var,
                                  double *old_mean, double *old_var, int *count,
-                                 int *finish, float sigma_cut, int round, int i,
+                                 int *finish, float sigma_cut, int round,
                                  int flag) {
-  if (*count == 0) {
-    if (threadIdx.x == 0) {
-      *mask1 = 0;  // Mark sample as inactive
-      *finish = 1; // Signal convergence
-    }
-    return;
-  }
+
   // Broadcast mean and stddev
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  if (tid >= n)
-    return;
+  int i = blockIdx.y * blockDim.y;
 
-  double mean = *d_mean;
-  double stdv = *d_var;
+  bool active = tid < m;
 
-  // 4) update per-sample mask
-
-  if (stdv * 1000000.0 < 0.1) {
-    if (tid == 0) {
-      printf("\nVariance zero, Sample %d %d %lf %.16lf", i, round, mean, stdv);
-      *mask1 = 0;  // Mark sample as inactive
+  if (active) {
+    d_stage = d_stage + i * (size_t)m;
+    mask1 = mask1 + i;
+    mask2 = mask2 + i * (size_t)m;
+    d_mean = d_mean + i;
+    d_var = d_var + i;
+    old_mean = old_mean + i;
+    old_var = old_var + i;
+    count = count + i;
+    finish = finish + i;
+    if (*count == 0) {
+      *mask1 = 0;
       *finish = 1; // Signal convergence
     }
-    return;
-  }
-
-  float val = (d_stage[tid] - mean) / stdv;
-  if (flag || *mask1)
-    mask2[tid] = (fabs(val) < sigma_cut);
-
-  // __syncthreads();
-
-  // 5) convergence test
-  if (tid == 0) {
-    double oldm = *old_mean;
-    double oldv = *old_var;
-    if (fabs(mean - oldm) < 1e-3 && fabs(stdv - oldv) < 1e-4 && round > 1) {
-      *finish = 1;
+    if (*finish == 1) {
+      active = false;
     }
-    *old_mean = mean;
-    *old_var = stdv;
   }
-  __syncthreads();
-}
+
+  if (active) {
+    double mean = *d_mean;
+    double stdv = *d_var;
+    bool active2 = true;
+
+    // 4) update per-sample mask
+
+    if (stdv * 1000000.0 < 0.1) {
+      if (tid == 0) {
+        printf("\nVariance zero, Sample %d %d %lf %.16lf", i, round, mean,
+               stdv);
+        *mask1 = 0;  // Mark sample as inactive
+        *finish = 1; // Signal convergence
+      }
+      active2 = false;
+    }
+
+    if (active2) {
+
+      float val = (d_stage[tid] - mean) / stdv;
+      if (flag || *mask1)
+        mask2[tid] = (fabs(val) < sigma_cut);
+
+      // __syncthreads();
+
+      // 5) convergence test
+      if (tid == 0) {
+        double oldm = *old_mean;
+        double oldv = *old_var;
+        if (fabs(mean - oldm) < 1e-3 && fabs(stdv - oldv) < 1e-4 && round > 1) {
+          *finish = 1;
+        }
+        *old_mean = mean;
+        *old_var = stdv;
+      }
+    }
+  }
+} // namespace astroaccelerate
 
 // need precalculata coordinate
 
@@ -262,23 +295,23 @@ static __global__ void Replace(float *d_stage, int n, float *random,
                                curandStatePhilox4_32_10_t *state) {
 
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  if (tid >= n) {
-    return;
-  }
+  bool active = tid < n;
 
-  if (*mask)
-    d_stage[tid] = (d_stage[tid] - *mean) / *var;
-  else {
+  if (active) {
+    if (*mask)
+      d_stage[tid] = (d_stage[tid] - *mean) / *var;
+    else {
 
-    curand_init(seed, /*subsequence*/ tid, /*offset*/ 0, &state[tid]);
+      curand_init(seed, /*subsequence*/ tid, /*offset*/ 0, &state[tid]);
 
-    int perm_one = (int)(curand_uniform(&state[tid]) * n); // curand?
-    d_stage[tid] = random[(tid + perm_one) % n];
+      int perm_one = (int)(curand_uniform(&state[tid]) * n); // curand?
+      d_stage[tid] = random[(tid + perm_one) % n];
 
-    if (tid == 0) {
-      *mean = 0;
-      *var = 1;
-      *mask = 1;
+      if (tid == 0) {
+        *mean = 0;
+        *var = 1;
+        *mask = 1;
+      }
     }
   }
 }
@@ -291,24 +324,26 @@ Global_Converge(double *mean, double *var, double *old_mean_of_mean,
                 int *mask, int n, float sigma_cut, int *counter, int *finish) {
 
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  if (tid >= n)
-    return;
+  bool active = tid < n;
 
-  if (fabs(mean[tid] - *mean_of_mean) / *var_of_mean > sigma_cut ||
-      fabs(var[tid] - *mean_of_var) / *var_of_var > sigma_cut)
-    mask[tid] = 0;
+  if (active) {
 
-  if (tid == 0) {
-    if (fabs(*mean_of_mean - *old_mean_of_mean) < 0.001 &&
-        fabs(*var_of_mean - *old_var_of_mean) < 0.001 &&
-        fabs(*mean_of_var - *old_mean_of_var) < 0.001 &&
-        fabs(*var_of_var - *old_var_of_var) < 0.001) {
-      *finish = 1; // Signal convergence
+    if (fabs(mean[tid] - *mean_of_mean) / *var_of_mean > sigma_cut ||
+        fabs(var[tid] - *mean_of_var) / *var_of_var > sigma_cut)
+      mask[tid] = 0;
+
+    if (tid == 0) {
+      if (fabs(*mean_of_mean - *old_mean_of_mean) < 0.001 &&
+          fabs(*var_of_mean - *old_var_of_mean) < 0.001 &&
+          fabs(*mean_of_var - *old_mean_of_var) < 0.001 &&
+          fabs(*var_of_var - *old_var_of_var) < 0.001) {
+        *finish = 1; // Signal convergence
+      }
+      *old_mean_of_mean = *mean_of_mean;
+      *old_var_of_mean = *var_of_mean;
+      *old_mean_of_var = *mean_of_var;
+      *old_var_of_var = *var_of_var;
     }
-    *old_mean_of_mean = *mean_of_mean;
-    *old_var_of_mean = *var_of_mean;
-    *old_mean_of_var = *mean_of_var;
-    *old_var_of_var = *var_of_var;
   }
 }
 
@@ -329,19 +364,19 @@ Global_Replacement(float *d_stage, double *clipping_constant, double *mean,
                    double *var, double *mean_of_mean, double *var_of_mean,
                    double *mean_of_var, double *var_of_var, int *mask, int n,
                    int m, float *random, unsigned long long seed,
-                   curandStatePhilox4_32_10_t *state
+                   curandStatePhilox4_32_10_t *state) {
 
-) {
   int tid_X = threadIdx.x + blockDim.x * blockIdx.x;
   int tid_Y = threadIdx.y + blockDim.y * blockIdx.y;
-  if (tid_X >= n || tid_Y >= m)
-    return;
+  bool active = tid_X < n && tid_Y < m;
 
-  double val = (mean[tid_X] - *mean_of_mean) / *var_of_mean;
-  double val2 = (var[tid_X] - *mean_of_var) / *var_of_var;
-  if (fabs(val) > *clipping_constant && fabs(val2) > *clipping_constant) {
-    int perm_one = (int)((curand_uniform(&state[tid_X]) * n)); // curand?
-    d_stage[tid_X * (size_t)m + tid_Y] = random[(tid_Y + perm_one) % m];
+  if (active) {
+    double val = (mean[tid_X] - *mean_of_mean) / *var_of_mean;
+    double val2 = (var[tid_X] - *mean_of_var) / *var_of_var;
+    if (fabs(val) > *clipping_constant && fabs(val2) > *clipping_constant) {
+      int perm_one = (int)((curand_uniform(&state[tid_X]) * n)); // curand?
+      d_stage[tid_X * (size_t)m + tid_Y] = random[(tid_Y + perm_one) % m];
+    }
   }
 }
 
@@ -396,7 +431,7 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
   set_int_array<<<block_x, thread_x>>>(mask, n,
                                        1); // Set all channels to active
 
-  unsigned long long seed = (unsigned long long)time(NULL);
+  unsigned long long seed = (unsigned long long)12345;
   printf("Using seed %llu\n", seed);
 
   while (*finish == 0) {
@@ -408,11 +443,11 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
 
     GlobStats<<<block_x, thread_x>>>(mean, n, mask, mean_of_mean, var_of_mean,
                                      counter);
-    Calc<<<1, 1>>>(mean_of_mean, var_of_mean, counter);
+    Calc<<<1, 1>>>(mean_of_mean, var_of_mean, counter, 1);
     checkCudaError(cudaMemset(counter, 0, sizeof(int)));
     GlobStats<<<block_x, thread_x>>>(var, n, mask, mean_of_var, var_of_var,
                                      counter);
-    Calc<<<1, 1>>>(mean_of_var, var_of_var, counter);
+    Calc<<<1, 1>>>(mean_of_var, var_of_var, counter, 1);
 
     Global_Converge<<<block_x, thread_x>>>(
         mean, var, old_mean_of_mean, old_var_of_mean, old_mean_of_var,
@@ -467,12 +502,13 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
 static void local_stats(float *d_stage, int n, int m, double *d_mean,
                         double *d_var, int *d_mask1, int *d_mask2,
                         float sigma_cut, float *d_random,
-                        curandStatePhilox4_32_10_t *state, int flag, int blocks,
-                        int threads) {
+                        curandStatePhilox4_32_10_t *state, int flag,
+                        int blocks_x, int threads_x, int blocks_y,
+                        int threads_y) {
 
   int *finish, unfinish = 0, *count, *temp_mask;
   double *mean, *var, *old_mean, *old_var;
-  unsigned long long seed = (unsigned long long)time(NULL);
+  unsigned long long seed = (unsigned long long)12345;
 
   /*cudaStream_t* stream = (cudaStream_t*)malloc(n * sizeof(cudaStream_t));
   for(int i = 0; i < n; ++i) {
@@ -499,10 +535,14 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
   checkCudaError(cudaMemset(var, 0, n * sizeof(double)));
   checkCudaError(cudaMemset(count, 0, n * sizeof(int)));
   checkCudaError(cudaMemset(temp_mask, 0, n * m * sizeof(int)));
-  printf("\nblocks = %d, threads = %d\n", blocks, threads);
-  set_int_array<<<blocks * n, threads /*, 0, stream[0]*/>>>(
+  printf("\nblocks = %d, threads = %d\n", blocks_x, threads_x);
+  set_int_array<<<blocks_x * n, threads_x /*, 0, stream[0]*/>>>(
       temp_mask, n * m, 1); // Set all spectra to inactive
   checkCudaError(cudaDeviceSynchronize());
+  dim3 blockDim(threads_x, 1);
+
+  // number of blocks needed in each dimension (round up)
+  dim3 gridDim(blocks_x, n);
 
   int round = 1;
   while (unfinish == 0) {
@@ -516,24 +556,24 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
         checkCudaError(cudaMemset(mean + i, 0, sizeof(double)));
         checkCudaError(cudaMemset(var + i, 0, sizeof(double)));
         checkCudaError(cudaMemset(count + i, 0, sizeof(int)));
-
-        Stats<<<blocks, threads /*, 0, stream[i]*/>>>(
-            d_stage + i * m, m, temp_mask + i * m, mean + i, var + i, count + i,
-            finish + i);
-
-        Calc<<<1, 1>>>(mean + i, var + i, count + i);
-
-        SigmaClip<<<blocks, threads /*, 0, stream[i]*/>>>(
-            d_stage + i * m, m, d_mask1 + i, temp_mask + i * m, mean + i,
-            var + i, old_mean + i, old_var + i, count + i, finish + i,
-            sigma_cut, round, i, flag);
       }
     }
+
+    Stats<<<gridDim, blockDim /*, 0, stream[i]*/>>>(d_stage, n, m, temp_mask,
+                                                    mean, var, count, finish);
+
+    Calc<<<blocks_y, threads_y>>>(mean, var, count, n);
+
+    SigmaClip<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
+        d_stage, n, m, d_mask1, temp_mask, mean, var, old_mean, old_var, count,
+        finish, sigma_cut, round, flag);
     round++;
+    printf("Round %d: unfinish = %d\n", round, unfinish);
     checkCudaError(cudaDeviceSynchronize());
-  }
+  } // namespace astroaccelerate
+
   for (int i = 0; i < n; ++i) {
-    Replace<<<blocks, threads /*, 0, stream[i]*/>>>(
+    Replace<<<blocks_x, threads_x /*, 0, stream[i]*/>>>(
         d_stage + i * m, m, d_random, mean + i, var + i, d_mask1 + i, seed,
         finish + i, state);
   }
@@ -683,7 +723,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   cudaMalloc(&d_states, max(nsamp, nchans) * sizeof(*d_states));
 
   // 2) Seed it (change per run if you want non-reproducible)
-  unsigned long long seed = (unsigned long long)time(NULL); // or time-based
+  unsigned long long seed = (unsigned long long)12345; // or time-based
   CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, seed));
 
   CHECK_CURAND(curandGenerateNormal(gen, d_random_spectra_one, nchans, 0, 1));
@@ -723,11 +763,13 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   // Find the BLN and try to flatten the input data per channel (remove
   // non-stationary component).
 
+  cublasHandle_t cublas_handle;
+
   auto t0 = std::chrono::steady_clock::now();
 
   local_stats(dev_stage, nchans, nsamp, d_chan_mean, d_chan_var, d_chan_mask,
               d_spectra_mask, sigma_cut, d_random_chan_one, d_states, 1,
-              block_chan, thread_chan);
+              block_chan, thread_chan, block_spectra, thread_spectra);
 
   auto t1 = std::chrono::steady_clock::now();
   auto gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -735,6 +777,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   std::ofstream time_record_gpu("time_gpu.txt");
   time_record_gpu << "Time for per channel sigma clip: " << gpu_ms
                   << "seconds\n";
+  time_record_gpu.close();
 
   double h_chan_mean[nchans], h_chan_var[nchans];
   checkCudaError(cudaMemcpy(h_chan_mean, d_chan_mean, nchans * sizeof(double),
@@ -772,7 +815,8 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
 
   local_stats(dev_stage, nsamp, nchans, d_spectra_mean, d_spectra_var,
               d_spectra_mask, d_chan_mask, sigma_cut, d_random_spectra_one,
-              d_states, 0, block_spectra, thread_spectra);
+              d_states, 0, block_spectra, thread_spectra, block_chan,
+              thread_chan);
 
   t1 = std::chrono::steady_clock::now();
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -872,6 +916,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   cublasDestroy(handle);
   checkCudaError(cudaFree(d_ones));
   curandDestroyGenerator(gen);
+  cublasDestroy(cublas_handle);
 
   cudaDeviceReset(); // Reset the device to free resources
 }
