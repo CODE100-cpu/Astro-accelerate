@@ -206,9 +206,8 @@ static __global__ void GlobStats(double *d_stage, int n, int *mask,
   }
 }
 
-static __global__ void Calc(double *d_mean, double *d_var, int *count, int n,
-                            int index) {
-  int tid = threadIdx.x + blockDim.x * blockIdx.x + index;
+static __global__ void Calc(double *d_mean, double *d_var, int *count, int n) {
+  int tid = threadIdx.x + blockDim.x * blockIdx.x;
   bool active = tid < n;
   if (active && count[tid] != 0) {
     d_mean[tid] /= count[tid];
@@ -223,7 +222,6 @@ static __global__ void SigmaClip(float *d_stage, int n, int m, int *mask1,
                                  double *old_mean, double *old_var, int *count,
                                  int *finish, float sigma_cut, int round,
                                  int flag, int index) {
-
   // Broadcast mean and stddev
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   int i = blockIdx.y * blockDim.y + index;
@@ -294,22 +292,21 @@ static __global__ void SigmaClip(float *d_stage, int n, int m, int *mask1,
 
 // need precalculata coordinate
 
-static __global__ void Replace(float *d_stage, int n, int m, float *random,
+static __global__ void Replace(float *d_stage, int m, float *random,
                                double *mean, double *var, int *mask,
                                unsigned long long seed, int *finish,
-                               curandStatePhilox4_32_10_t *state, int index) {
-
+                               curandStatePhilox4_32_10_t *state) {
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  int i = blockIdx.y * blockDim.y + index;
-  bool active = tid < m && i < n;
+  // int i = blockIdx.y * blockDim.y + index;
+  bool active = tid < m; //&& i < n;
 
   if (active) {
-    d_stage = d_stage + i * (size_t)m;
+    /*d_stage = d_stage + i * (size_t)m;
     mask = mask + i;
     mean = mean + i;
     var = var + i;
     state = state + i;
-    finish = finish + i;
+    finish = finish + i;*/
 
     if (*mask)
       d_stage[tid] = (d_stage[tid] - *mean) / *var;
@@ -317,8 +314,8 @@ static __global__ void Replace(float *d_stage, int n, int m, float *random,
 
       curand_init(seed, /*subsequence*/ tid, /*offset*/ 0, &state[tid]);
 
-      int perm_one = (int)(curand_uniform(&state[tid]) * n); // curand?
-      d_stage[tid] = random[(tid + perm_one) % n];
+      int perm_one = (int)(curand_uniform(&state[tid]) * m); // curand?
+      d_stage[tid] = random[(tid + perm_one) % m];
 
       if (tid == 0) {
         *mean = 0;
@@ -335,7 +332,6 @@ Global_Converge(double *mean, double *var, double *old_mean_of_mean,
                 double *old_var_of_var, double *mean_of_mean,
                 double *var_of_mean, double *mean_of_var, double *var_of_var,
                 int *mask, int n, float sigma_cut, int *counter, int *finish) {
-
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   bool active = tid < n;
 
@@ -378,7 +374,6 @@ Global_Replacement(float *d_stage, double *clipping_constant, double *mean,
                    double *mean_of_var, double *var_of_var, int *mask, int n,
                    int m, float *random, unsigned long long seed,
                    curandStatePhilox4_32_10_t *state) {
-
   int tid_X = threadIdx.x + blockDim.x * blockIdx.x;
   int tid_Y = threadIdx.y + blockDim.y * blockIdx.y;
   bool active = tid_X < n && tid_Y < m;
@@ -395,7 +390,6 @@ Global_Replacement(float *d_stage, double *clipping_constant, double *mean,
 
 static __global__ void Scale(float *d_stage, int n, int m, float mean_rescale,
                              float var_rescale) {
-
   int tid_X = threadIdx.x + blockDim.x * blockIdx.x;
   int tid_Y = threadIdx.y + blockDim.y * blockIdx.y;
   if (tid_X < n && tid_Y < m) {
@@ -409,7 +403,6 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
              double *var, int *mask, float *random_one,
              curandStatePhilox4_32_10_t *state, int block_x, int thread_x,
              int block_y, int thread_y) {
-
   double *mean_rescale, *var_rescale, *clipping_constant;
   checkCudaError(cudaMalloc(&clipping_constant, sizeof(double)));
   checkCudaError(cudaMemset(clipping_constant, 0, sizeof(double)));
@@ -456,11 +449,11 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
 
     GlobStats<<<block_x, thread_x>>>(mean, n, mask, mean_of_mean, var_of_mean,
                                      counter);
-    Calc<<<1, 1>>>(mean_of_mean, var_of_mean, counter, 1, 0);
+    Calc<<<1, 1>>>(mean_of_mean, var_of_mean, counter, 1);
     checkCudaError(cudaMemset(counter, 0, sizeof(int)));
     GlobStats<<<block_x, thread_x>>>(var, n, mask, mean_of_var, var_of_var,
                                      counter);
-    Calc<<<1, 1>>>(mean_of_var, var_of_var, counter, 1, 0);
+    Calc<<<1, 1>>>(mean_of_var, var_of_var, counter, 1);
 
     Global_Converge<<<block_x, thread_x>>>(
         mean, var, old_mean_of_mean, old_var_of_mean, old_mean_of_var,
@@ -525,7 +518,6 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
                         curandStatePhilox4_32_10_t *state, int flag,
                         int blocks_x, int threads_x, int blocks_y,
                         int threads_y, cublasHandle_t cublas_handle) {
-
   int *finish, unfinish = 1, *count, *temp_mask, *ones;
   double *mean, *var, *old_mean, *old_var, *holder;
   unsigned long long seed = (unsigned long long)12345;
@@ -582,12 +574,13 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
     checkCudaError(cudaMemset(count, 0, n * sizeof(int)));
 
     for (int i = 0; i < loop; ++i) {
-
       Stats<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
           d_stage, n, m, temp_mask, mean, var, count, finish, i * grid_y_Max);
+    }
 
-      Calc<<<blocks_y, threads_y>>>(mean, var, count, n, i * grid_y_Max);
+    Calc<<<blocks_y, threads_y>>>(mean, var, count, n);
 
+    for (int i = 0; i < loop; ++i) {
       SigmaClip<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
           d_stage, n, m, d_mask1, temp_mask, mean, var, old_mean, old_var,
           count, finish, sigma_cut, round, flag, i * grid_y_Max);
@@ -598,18 +591,10 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
     checkCudaError(cudaDeviceSynchronize());
   }
 
-  for (int i = 0; i < loop; ++i) {
-    Replace<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
-        d_stage, n, m, d_random, mean, var, d_mask1, seed, finish, state,
-        i * grid_y_Max);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      fprintf(stderr, "CUDA Error in Replace kernel: %s\n",
-              cudaGetErrorString(err));
-      exit(EXIT_FAILURE);
-    } else {
-      printf("Replace kernel launched successfully for block %d\n", i);
-    }
+  for (int i = 0; i < n; ++i) {
+    Replace<<<blocks_x, threads_x /*, 0, stream[i]*/>>>(
+        d_stage + i * m, m, d_random, mean + i, var + i, d_mask1 + i, seed,
+        finish + i, state);
   }
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -673,7 +658,6 @@ float *transpose_cublas(float *d_in, int m, int n) {
 }
 
 void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
-
   // initilization and memory allocation
   int dev = 0;
   cudaSetDevice(dev);
