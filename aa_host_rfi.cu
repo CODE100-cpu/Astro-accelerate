@@ -60,10 +60,10 @@ static __global__ void fill_ones(float *x, int n) {
 
 static __global__ void Stats(float *d_stage, int n, int m, int *mask,
                              double *d_mean, double *d_var, int *d_count,
-                             int *finish) {
+                             int *finish, int index) {
 
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  int i = blockIdx.y * blockDim.y;
+  int i = blockIdx.y * blockDim.y + index;
   int wid = threadIdx.x / 32;  // warp ID
   int lane = threadIdx.x % 32; // lane ID within the warp
   double sum = 0.0, sum2 = 0.0;
@@ -204,10 +204,11 @@ static __global__ void GlobStats(double *d_stage, int n, int *mask,
     atomicAdd(d_var, sum2);
     atomicAdd(d_count, cnt);
   }
-} // namespace astroaccelerate
+}
 
-static __global__ void Calc(double *d_mean, double *d_var, int *count, int n) {
-  int tid = threadIdx.x + blockDim.x * blockIdx.x;
+static __global__ void Calc(double *d_mean, double *d_var, int *count, int n,
+                            int index) {
+  int tid = threadIdx.x + blockDim.x * blockIdx.x + index;
   bool active = tid < n;
   if (active && count[tid] != 0) {
     d_mean[tid] /= count[tid];
@@ -221,13 +222,13 @@ static __global__ void SigmaClip(float *d_stage, int n, int m, int *mask1,
                                  int *mask2, double *d_mean, double *d_var,
                                  double *old_mean, double *old_var, int *count,
                                  int *finish, float sigma_cut, int round,
-                                 int flag) {
+                                 int flag, int index) {
 
   // Broadcast mean and stddev
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  int i = blockIdx.y * blockDim.y;
+  int i = blockIdx.y * blockDim.y + index;
 
-  bool active = tid < m;
+  bool active = i < n && *(finish + i) == 0;
 
   if (active) {
     d_stage = d_stage + i * (size_t)m;
@@ -239,14 +240,18 @@ static __global__ void SigmaClip(float *d_stage, int n, int m, int *mask1,
     old_var = old_var + i;
     count = count + i;
     finish = finish + i;
+
     if (*count == 0) {
-      *mask1 = 0;
-      *finish = 1; // Signal convergence
-    }
-    if (*finish == 1) {
-      active = false;
+      if (tid == 0) {
+        *mask1 = 0;
+        *finish = 1; // Signal convergence
+      }
+      active = false; // No data to process
     }
   }
+  active = active && (tid < m);
+
+  __syncthreads();
 
   if (active) {
     double mean = *d_mean;
@@ -271,8 +276,6 @@ static __global__ void SigmaClip(float *d_stage, int n, int m, int *mask1,
       if (flag || *mask1)
         mask2[tid] = (fabs(val) < sigma_cut);
 
-      // __syncthreads();
-
       // 5) convergence test
       if (tid == 0) {
         double oldm = *old_mean;
@@ -285,19 +288,29 @@ static __global__ void SigmaClip(float *d_stage, int n, int m, int *mask1,
       }
     }
   }
+
+  __syncthreads();
 } // namespace astroaccelerate
 
 // need precalculata coordinate
 
-static __global__ void Replace(float *d_stage, int n, float *random,
+static __global__ void Replace(float *d_stage, int n, int m, float *random,
                                double *mean, double *var, int *mask,
                                unsigned long long seed, int *finish,
-                               curandStatePhilox4_32_10_t *state) {
+                               curandStatePhilox4_32_10_t *state, int index) {
 
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  bool active = tid < n;
+  int i = blockIdx.y * blockDim.y + index;
+  bool active = tid < m && i < n;
 
   if (active) {
+    d_stage = d_stage + i * (size_t)m;
+    mask = mask + i;
+    mean = mean + i;
+    var = var + i;
+    state = state + i;
+    finish = finish + i;
+
     if (*mask)
       d_stage[tid] = (d_stage[tid] - *mean) / *var;
     else {
@@ -443,11 +456,11 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
 
     GlobStats<<<block_x, thread_x>>>(mean, n, mask, mean_of_mean, var_of_mean,
                                      counter);
-    Calc<<<1, 1>>>(mean_of_mean, var_of_mean, counter, 1);
+    Calc<<<1, 1>>>(mean_of_mean, var_of_mean, counter, 1, 0);
     checkCudaError(cudaMemset(counter, 0, sizeof(int)));
     GlobStats<<<block_x, thread_x>>>(var, n, mask, mean_of_var, var_of_var,
                                      counter);
-    Calc<<<1, 1>>>(mean_of_var, var_of_var, counter, 1);
+    Calc<<<1, 1>>>(mean_of_var, var_of_var, counter, 1, 0);
 
     Global_Converge<<<block_x, thread_x>>>(
         mean, var, old_mean_of_mean, old_var_of_mean, old_mean_of_var,
@@ -499,27 +512,24 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
   return std::pair<double, double>(h_mean_of_mean, h_mean_of_var);
 }
 
+static __global__ void dot(double *input1, int *input2, int n) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (tid < n) {
+    input1[tid] = input1[tid] * input2[tid];
+  }
+} // namespace astroaccelerate
+
 static void local_stats(float *d_stage, int n, int m, double *d_mean,
                         double *d_var, int *d_mask1, int *d_mask2,
                         float sigma_cut, float *d_random,
                         curandStatePhilox4_32_10_t *state, int flag,
                         int blocks_x, int threads_x, int blocks_y,
-                        int threads_y) {
+                        int threads_y, cublasHandle_t cublas_handle) {
 
-  int *finish, unfinish = 0, *count, *temp_mask;
-  double *mean, *var, *old_mean, *old_var;
+  int *finish, unfinish = 1, *count, *temp_mask, *ones;
+  double *mean, *var, *old_mean, *old_var, *holder;
   unsigned long long seed = (unsigned long long)12345;
 
-  /*cudaStream_t* stream = (cudaStream_t*)malloc(n * sizeof(cudaStream_t));
-  for(int i = 0; i < n; ++i) {
-    cudaStreamCreate(&stream[i]);
-  }
-  size_t free_mem, total_mem;
-  cudaMemGetInfo(&free_mem, &total_mem);
-  printf(
-      "Free memory: %zu bytes\nTotal memory: %zu bytes\n", free_mem,
-  total_mem); printf("Used memory: %zu bytes\n", total_mem - free_mem);
-                          */
   checkCudaError(cudaMallocManaged((void **)&finish, n * sizeof(int)));
   checkCudaError(cudaMalloc((void **)&old_mean, n * sizeof(double)));
   checkCudaError(cudaMalloc((void **)&old_var, n * sizeof(double)));
@@ -527,6 +537,8 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
   checkCudaError(cudaMalloc((void **)&var, n * sizeof(double)));
   checkCudaError(cudaMalloc((void **)&count, n * sizeof(int)));
   checkCudaError(cudaMalloc((void **)&temp_mask, n * m * sizeof(int)));
+  checkCudaError(cudaMalloc((void **)&ones, n * sizeof(int)));
+  checkCudaError(cudaMalloc((void **)&holder, n * sizeof(double)));
 
   checkCudaError(cudaMemset(finish, 0, n * sizeof(int)));
   checkCudaError(cudaMemset(old_mean, 0, n * sizeof(double)));
@@ -535,6 +547,10 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
   checkCudaError(cudaMemset(var, 0, n * sizeof(double)));
   checkCudaError(cudaMemset(count, 0, n * sizeof(int)));
   checkCudaError(cudaMemset(temp_mask, 0, n * m * sizeof(int)));
+  checkCudaError(cudaMemset(holder, 0, n * sizeof(double)));
+
+  set_int_array<<<blocks_y, threads_y>>>(ones, n,
+                                         1); // Set all channels to active
   printf("\nblocks = %d, threads = %d\n", blocks_x, threads_x);
   set_int_array<<<blocks_x * n, threads_x /*, 0, stream[0]*/>>>(
       temp_mask, n * m, 1); // Set all spectra to inactive
@@ -542,40 +558,64 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
   dim3 blockDim(threads_x, 1);
 
   // number of blocks needed in each dimension (round up)
-  dim3 gridDim(blocks_x, n);
+  int grid_y_Max = 65535; // Maximum number of blocks in one dimension
+  int loop = n > grid_y_Max ? (n + grid_y_Max - 1) / grid_y_Max : 1;
+  int grid_1 = n > grid_y_Max ? grid_y_Max : n; // Number of blocks in y
+
+  dim3 gridDim(blocks_x, grid_1);
 
   int round = 1;
-  while (unfinish == 0) {
-    unfinish = 1;
-    for (int i = 0; i < n; i++) { // repair nsamp nchan problem
+  while (unfinish == 1) {
 
+    unfinish = 0;
+    for (int i = 0; i < n; ++i) {
       if (finish[i] == 0) {
-
-        unfinish = 0;
-
-        checkCudaError(cudaMemset(mean + i, 0, sizeof(double)));
-        checkCudaError(cudaMemset(var + i, 0, sizeof(double)));
-        checkCudaError(cudaMemset(count + i, 0, sizeof(int)));
+        unfinish = 1;
+        break;
       }
     }
 
-    Stats<<<gridDim, blockDim /*, 0, stream[i]*/>>>(d_stage, n, m, temp_mask,
-                                                    mean, var, count, finish);
+    dot<<<blocks_y, threads_y /*, 0, stream[i]*/>>>(mean, finish, n);
 
-    Calc<<<blocks_y, threads_y>>>(mean, var, count, n);
+    dot<<<blocks_y, threads_y /*, 0, stream[i]*/>>>(var, finish, n);
 
-    SigmaClip<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
-        d_stage, n, m, d_mask1, temp_mask, mean, var, old_mean, old_var, count,
-        finish, sigma_cut, round, flag);
+    checkCudaError(cudaMemset(count, 0, n * sizeof(int)));
+
+    for (int i = 0; i < loop; ++i) {
+
+      Stats<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
+          d_stage, n, m, temp_mask, mean, var, count, finish, i * grid_y_Max);
+
+      Calc<<<blocks_y, threads_y>>>(mean, var, count, n, i * grid_y_Max);
+
+      SigmaClip<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
+          d_stage, n, m, d_mask1, temp_mask, mean, var, old_mean, old_var,
+          count, finish, sigma_cut, round, flag, i * grid_y_Max);
+    }
+
     round++;
-    printf("Round %d: unfinish = %d\n", round, unfinish);
+    // printf("Round %d: unfinish = %d\n", round, unfinish);
     checkCudaError(cudaDeviceSynchronize());
-  } // namespace astroaccelerate
+  }
 
-  for (int i = 0; i < n; ++i) {
-    Replace<<<blocks_x, threads_x /*, 0, stream[i]*/>>>(
-        d_stage + i * m, m, d_random, mean + i, var + i, d_mask1 + i, seed,
-        finish + i, state);
+  for (int i = 0; i < loop; ++i) {
+    Replace<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
+        d_stage, n, m, d_random, mean, var, d_mask1, seed, finish, state,
+        i * grid_y_Max);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      fprintf(stderr, "CUDA Error in Replace kernel: %s\n",
+              cudaGetErrorString(err));
+      exit(EXIT_FAILURE);
+    } else {
+      printf("Replace kernel launched successfully for block %d\n", i);
+    }
+  }
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    fprintf(stderr, "CUDA Error in Replace kernel: %s\n",
+            cudaGetErrorString(err));
+    exit(EXIT_FAILURE);
   }
   checkCudaError(cudaDeviceSynchronize());
 
@@ -764,12 +804,14 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   // non-stationary component).
 
   cublasHandle_t cublas_handle;
+  cublasCreate(&cublas_handle);
 
   auto t0 = std::chrono::steady_clock::now();
 
   local_stats(dev_stage, nchans, nsamp, d_chan_mean, d_chan_var, d_chan_mask,
               d_spectra_mask, sigma_cut, d_random_chan_one, d_states, 1,
-              block_chan, thread_chan, block_spectra, thread_spectra);
+              block_chan, thread_chan, block_spectra, thread_spectra,
+              cublas_handle);
 
   auto t1 = std::chrono::steady_clock::now();
   auto gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -816,7 +858,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   local_stats(dev_stage, nsamp, nchans, d_spectra_mean, d_spectra_var,
               d_spectra_mask, d_chan_mask, sigma_cut, d_random_spectra_one,
               d_states, 0, block_spectra, thread_spectra, block_chan,
-              thread_chan);
+              thread_chan, cublas_handle);
 
   t1 = std::chrono::steady_clock::now();
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -898,7 +940,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   }
   fclose(fp_mask);
 
-  printf("\n%lf %lf", mean_rescale / orig_mean, var_rescale / orig_var);
+  printf("\n%lf %lf\n", mean_rescale / orig_mean, var_rescale / orig_var);
 
   free(stage);
   checkCudaError(cudaFree(d_chan_mask));
@@ -924,6 +966,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
 
 using namespace astroaccelerate;
 int main() {
+
   std::vector<unsigned short> input_buffer;
   std::ifstream infile("input.txt");
   unsigned short value;
