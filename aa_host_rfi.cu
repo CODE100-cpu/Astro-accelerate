@@ -16,30 +16,12 @@
 //#include "aa_params.hpp"
 namespace astroaccelerate {
 
-const int BlockSize = 10;
-const int ThreadSize = 1024;
-
-#define cublasErrCheck(stat)                                                   \
-  { cublasErrCheck_((stat), __FILE__, __LINE__); }
-static void cublasErrCheck_(cublasStatus_t stat, const char *file, int line) {
-  if (stat != CUBLAS_STATUS_SUCCESS) {
-    fprintf(stderr, "cuBLAS Error: %d %s %d\n", stat, file, line);
-  }
-}
-static __global__ void Message() { printf("RFI Reduction unfinished.\n"); }
-static __global__ void set_int_array(int *arr, int N, int val) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < N)
-    arr[idx] = val;
-}
-
 static void checkCudaError(cudaError_t err) {
   if (err != cudaSuccess) {
     fprintf(stderr, "CUDA Error: %s\n", cudaGetErrorString(err));
     exit(EXIT_FAILURE);
   }
 }
-
 static void CHECK_CURAND(curandStatus_t err) {
   if (err != CURAND_STATUS_SUCCESS) {
     fprintf(stderr, "CURAND Error: %d\n", err);
@@ -52,28 +34,31 @@ static __global__ void fill_ones(float *x, int n) {
   if (i < n)
     x[i] = 1.0f;
 }
-// Calculates the sum and square sum of the input data stoed in d_mean and d_var
-// Uses warp-level reduction for efficiency
-// Uses shared memory to store per-warp results
+static __global__ void set_int_array(int *x, int n, int value) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n)
+    x[i] = value;
+}
 
-// need to make sure there is at least a full warp
+// Calculate the sum, square sum, and count of active elements in each row.
+// Make sure at least one warp is full
 
-static __global__ void Stats(float *d_stage, int n, int m, int *mask,
-                             double *d_mean, double *d_var, int *d_count,
-                             int *finish, int index) {
+static __global__ void LocalStatistics(float *d_stage, int n, int m, int *mask,
+                                       double *d_mean, double *d_var,
+                                       int *d_count, int *finish, int index) {
 
-  int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  int i = blockIdx.y * blockDim.y + index;
-  int wid = threadIdx.x / 32;  // warp ID
-  int lane = threadIdx.x % 32; // lane ID within the warp
+  int tid = threadIdx.x + blockDim.x * blockIdx.x; // the column index
+  int i = blockIdx.y * blockDim.y + index;         // the row index
+  int wid = threadIdx.x / 32;                      // warp ID
+  int lane = threadIdx.x % 32;                     // lane ID within the warp
+
   double sum = 0.0, sum2 = 0.0;
   int cnt = 0;
-  bool active = tid < m && i < n;
+  bool active = tid < m && i < n && *(finish + i) == 0;
 
-  // if (tid >= n)
-  //  return; // Out of bounds
-  // 1) compute local sums and sums of squares
   if (active) {
+
+    // Adjust pointers for the current row
 
     d_stage = d_stage + i * (size_t)m;
     mask = mask + i * (size_t)m;
@@ -81,9 +66,10 @@ static __global__ void Stats(float *d_stage, int n, int m, int *mask,
     d_var = d_var + i;
     d_count = d_count + i;
     finish = finish + i;
-    active = active && (*finish == 0);
 
-    if (mask[tid] && *finish == 0) {
+    // 1) compute local sums and sums of squares
+
+    if (mask[tid]) {
 
       float v = d_stage[tid];
       sum += v;
@@ -99,15 +85,14 @@ static __global__ void Stats(float *d_stage, int n, int m, int *mask,
   double *warp_sum2 = ws + warps_per_block;
   int *warp_cnt = (int *)(ws + 2 * warps_per_block);
 
-  // 2) warp-level reduction
+  // 2) warp-level reduction, remember to put shuffle outside of guard to avoid
+  // undefined behavior
 
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
     sum += __shfl_down_sync(-1, sum, offset);
     sum2 += __shfl_down_sync(-1, sum2, offset);
     cnt += __shfl_down_sync(-1, cnt, offset);
   }
-
-  // Shared memory to store per-warp results
 
   if (active && lane == 0) {
     warp_sum[wid] = sum;
@@ -122,28 +107,33 @@ static __global__ void Stats(float *d_stage, int n, int m, int *mask,
     sum = 0.0;
     sum2 = 0.0;
     cnt = 0;
+
     if (lane < warps_per_block) {
       sum = warp_sum[lane];
       sum2 = warp_sum2[lane];
       cnt = warp_cnt[lane];
     }
-    // final warp reduce
+
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
       sum += __shfl_down_sync(-1, sum, offset);
       sum2 += __shfl_down_sync(-1, sum2, offset);
       cnt += __shfl_down_sync(-1, cnt, offset);
     }
-    // Add up all the sum and sum2 and cnt to global memory
+
     if (lane == 0) {
       atomicAdd(d_mean, sum);
       atomicAdd(d_var, sum2);
       atomicAdd(d_count, cnt);
     }
   }
-} // namespace astroaccelerate
+}
 
-static __global__ void GlobStats(double *d_stage, int n, int *mask,
-                                 double *d_mean, double *d_var, int *d_count) {
+// Calculate the entire global mean and variance, count etc.
+// This is exactly same as Local_Statistics, except *d_stage is double type
+
+static __global__ void GlobalStatistics(double *d_stage, int n, int *mask,
+                                        double *d_mean, double *d_var,
+                                        int *d_count) {
 
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   int wid = threadIdx.x / 32;  // warp ID
@@ -192,13 +182,13 @@ static __global__ void GlobStats(double *d_stage, int n, int *mask,
     sum2 = warp_sum2[lane];
     cnt = warp_cnt[lane];
   }
-  // final warp reduce
+
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
     sum += __shfl_down_sync(-1, sum, offset);
     sum2 += __shfl_down_sync(-1, sum2, offset);
     cnt += __shfl_down_sync(-1, cnt, offset);
   }
-  // Add up all the sum and sum2 and cnt to global memory
+
   if (active && wid == 0 && lane == 0) {
     atomicAdd(d_mean, sum);
     atomicAdd(d_var, sum2);
@@ -206,6 +196,7 @@ static __global__ void GlobStats(double *d_stage, int n, int *mask,
   }
 }
 
+// Turn sums into the mean and standard deviation
 static __global__ void Calc(double *d_mean, double *d_var, int *count, int n) {
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   bool active = tid < n;
@@ -214,19 +205,19 @@ static __global__ void Calc(double *d_mean, double *d_var, int *count, int n) {
     d_var[tid] = d_var[tid] / count[tid] - (d_mean[tid] * d_mean[tid]);
     d_var[tid] = sqrt(d_var[tid]);
   }
-} // end of Calc
+}
 
-// finish & count check at host
+// Checks if the variance is 0, the statistics converges, and if the count is
+// bad
 static __global__ void SigmaClip(float *d_stage, int n, int m, int *mask1,
                                  int *mask2, double *d_mean, double *d_var,
-                                 double *old_mean, double *old_var, int *count,
                                  int *finish, float sigma_cut, int round,
                                  int flag, int index) {
-  // Broadcast mean and stddev
+
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   int i = blockIdx.y * blockDim.y + index;
 
-  bool active = i < n && *(finish + i) == 0;
+  bool active = tid < m && i < n && (*(finish + i) == 0);
 
   if (active) {
     d_stage = d_stage + i * (size_t)m;
@@ -234,104 +225,100 @@ static __global__ void SigmaClip(float *d_stage, int n, int m, int *mask1,
     mask2 = mask2 + i * (size_t)m;
     d_mean = d_mean + i;
     d_var = d_var + i;
-    old_mean = old_mean + i;
-    old_var = old_var + i;
-    count = count + i;
     finish = finish + i;
-
-    if (*count == 0) {
-      if (tid == 0) {
-        *mask1 = 0;
-        *finish = 1; // Signal convergence
-      }
-      active = false; // No data to process
-    }
   }
-  active = active && (tid < m);
 
   __syncthreads();
 
   if (active) {
     double mean = *d_mean;
     double stdv = *d_var;
-    bool active2 = true;
 
-    // 4) update per-sample mask
+    float val = (d_stage[tid] - mean) / stdv;
+    if (flag || *mask1)
+      mask2[tid] = (fabs(val) < sigma_cut);
+  }
+}
 
-    if (stdv * 1000000.0 < 0.1) {
-      if (tid == 0) {
-        printf("\nVariance zero, Sample %d %d %lf %.16lf", i, round, mean,
-               stdv);
-        *mask1 = 0;  // Mark sample as inactive
-        *finish = 1; // Signal convergence
-      }
-      active2 = false;
+static __global__ void Termination(double *d_mean, double *d_var,
+                                   double *old_mean, double *old_var, int *mask,
+                                   int *count, int *finish, int n, int round) {
+
+  int tid = threadIdx.x + blockDim.x * blockIdx.x;
+  bool active = tid < n && *(finish + tid) == 0;
+
+  if (active) {
+
+    if (count[tid] == 0) {
+      finish[tid] = 1;
+      mask[tid] = 0;
+      active = false;
     }
 
-    if (active2) {
-
-      float val = (d_stage[tid] - mean) / stdv;
-      if (flag || *mask1)
-        mask2[tid] = (fabs(val) < sigma_cut);
-
-      // 5) convergence test
-      if (tid == 0) {
-        double oldm = *old_mean;
-        double oldv = *old_var;
-        if (fabs(mean - oldm) < 1e-3 && fabs(stdv - oldv) < 1e-4 && round > 1) {
-          *finish = 1;
-        }
-        *old_mean = mean;
-        *old_var = stdv;
-      }
+    double mean = d_mean[tid];
+    double stdv = d_var[tid];
+    if (stdv * 1000000.0 < 0.1) {
+      printf("\nVariance zero, Sample %d %d %lf %.16lf", tid, round, mean,
+             stdv);
+      mask[tid] = 0;
+      finish[tid] = 1;
+      active = false;
+    }
+    double oldm = old_mean[tid];
+    double oldv = old_var[tid];
+    if (fabs(mean - oldm) < 1e-3 && fabs(stdv - oldv) < 1e-4 && round > 1) {
+      finish[tid] = 1;
     }
   }
 
-  __syncthreads();
+  if (active) {
+    old_mean[tid] = d_mean[tid];
+    old_var[tid] = d_var[tid];
+  }
 } // namespace astroaccelerate
 
-// need precalculata coordinate
+// Replaces masked values with random values from the random array
+static __global__ void LocalReplace(float *d_stage, int n, int m, float *random,
+                                    double *mean, double *var, int *mask,
+                                    unsigned long long seed,
+                                    curandStatePhilox4_32_10_t *state,
+                                    int index) {
 
-static __global__ void Replace(float *d_stage, int m, float *random,
-                               double *mean, double *var, int *mask,
-                               unsigned long long seed, int *finish,
-                               curandStatePhilox4_32_10_t *state) {
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
-  // int i = blockIdx.y * blockDim.y + index;
-  bool active = tid < m; //&& i < n;
+  int i = blockIdx.y * blockDim.y + index;
+  bool active = tid < m && i < n;
 
   if (active) {
-    /*d_stage = d_stage + i * (size_t)m;
+    d_stage = d_stage + i * (size_t)m;
     mask = mask + i;
     mean = mean + i;
     var = var + i;
     state = state + i;
-    finish = finish + i;*/
 
     if (*mask)
       d_stage[tid] = (d_stage[tid] - *mean) / *var;
     else {
-
-      curand_init(seed, /*subsequence*/ tid, /*offset*/ 0, &state[tid]);
-
-      int perm_one = (int)(curand_uniform(&state[tid]) * m); // curand?
+      int perm_one = (int)(curand_uniform(&state[tid]) * m);
       d_stage[tid] = random[(tid + perm_one) % m];
-
-      if (tid == 0) {
-        *mean = 0;
-        *var = 1;
-        *mask = 1;
-      }
     }
   }
 }
 
+static __global__ void Curand_init(curandStatePhilox4_32_10_t *state,
+                                   unsigned long long seed, int n) {
+  int tid = threadIdx.x + blockDim.x * blockIdx.x;
+  if (tid < n) {
+    curand_init(seed, tid, 0, &state[tid]);
+  }
+}
+
 static __global__ void
-Global_Converge(double *mean, double *var, double *old_mean_of_mean,
-                double *old_var_of_mean, double *old_mean_of_var,
-                double *old_var_of_var, double *mean_of_mean,
-                double *var_of_mean, double *mean_of_var, double *var_of_var,
-                int *mask, int n, float sigma_cut, int *counter, int *finish) {
+GlobalConverge(double *mean, double *var, double *old_mean_of_mean,
+               double *old_var_of_mean, double *old_mean_of_var,
+               double *old_var_of_var, double *mean_of_mean,
+               double *var_of_mean, double *mean_of_var, double *var_of_var,
+               int *mask, int n, float sigma_cut, int *counter, int *finish) {
+
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   bool active = tid < n;
 
@@ -356,7 +343,6 @@ Global_Converge(double *mean, double *var, double *old_mean_of_mean,
   }
 }
 
-// coould also use warp-shuffle reductions
 static __global__ void Clipping(double *clipping_constant, int *mask, int n) {
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   if (tid < n)
@@ -368,12 +354,13 @@ static __global__ void Clipping2(int n, double *clipping_constant) {
   *clipping_constant = sqrt(-2.0 * log(*clipping_constant * 2.506628275));
 }
 
-static __global__ void
-Global_Replacement(float *d_stage, double *clipping_constant, double *mean,
-                   double *var, double *mean_of_mean, double *var_of_mean,
-                   double *mean_of_var, double *var_of_var, int *mask, int n,
-                   int m, float *random, unsigned long long seed,
-                   curandStatePhilox4_32_10_t *state) {
+static __global__ void GlobalReplace(float *d_stage, double *clipping_constant,
+                                     double *mean, double *var,
+                                     double *mean_of_mean, double *var_of_mean,
+                                     double *mean_of_var, double *var_of_var,
+                                     int *mask, int n, int m, float *random,
+                                     unsigned long long seed,
+                                     curandStatePhilox4_32_10_t *state) {
   int tid_X = threadIdx.x + blockDim.x * blockIdx.x;
   int tid_Y = threadIdx.y + blockDim.y * blockIdx.y;
   bool active = tid_X < n && tid_Y < m;
@@ -447,15 +434,15 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
     checkCudaError(cudaMemset(var_of_var, 0, sizeof(double)));
     checkCudaError(cudaMemset(counter, 0, sizeof(int)));
 
-    GlobStats<<<block_x, thread_x>>>(mean, n, mask, mean_of_mean, var_of_mean,
-                                     counter);
+    GlobalStatistics<<<block_x, thread_x>>>(mean, n, mask, mean_of_mean,
+                                            var_of_mean, counter);
     Calc<<<1, 1>>>(mean_of_mean, var_of_mean, counter, 1);
     checkCudaError(cudaMemset(counter, 0, sizeof(int)));
-    GlobStats<<<block_x, thread_x>>>(var, n, mask, mean_of_var, var_of_var,
-                                     counter);
+    GlobalStatistics<<<block_x, thread_x>>>(var, n, mask, mean_of_var,
+                                            var_of_var, counter);
     Calc<<<1, 1>>>(mean_of_var, var_of_var, counter, 1);
 
-    Global_Converge<<<block_x, thread_x>>>(
+    GlobalConverge<<<block_x, thread_x>>>(
         mean, var, old_mean_of_mean, old_var_of_mean, old_mean_of_var,
         old_var_of_var, mean_of_mean, var_of_mean, mean_of_var, var_of_var,
         mask, n, sigma_cut, counter, finish);
@@ -471,6 +458,7 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
                             cudaMemcpyDeviceToHost));
   checkCudaError(cudaMemcpy(&h_var_of_var, var_of_var, sizeof(double),
                             cudaMemcpyDeviceToHost));
+  checkCudaError(cudaDeviceSynchronize());
 
   printf("mean_of_mean = %lf\n", h_mean_of_mean);
   printf("var_of_mean  = %lf\n", h_var_of_mean);
@@ -485,7 +473,7 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
   dim3 block(thread_x, min(1024 / thread_x, thread_y));
   dim3 grid(block_x, block_y * thread_y / block.y);
 
-  Global_Replacement<<<grid, block>>>(
+  GlobalReplace<<<grid, block>>>(
       d_stage, clipping_constant, mean, var, mean_of_mean, var_of_mean,
       mean_of_var, var_of_var, mask, n, m, random_one, seed, state);
 
@@ -508,9 +496,18 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
 static __global__ void dot(double *input1, int *input2, int n) {
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   if (tid < n) {
-    input1[tid] = input1[tid] * input2[tid];
+    input1[tid] = input1[tid] * (input2[tid] == 0 ? 0 : 1);
   }
-} // namespace astroaccelerate
+}
+
+static __global__ void Mask(double *mean, double *var, int *mask, int n) {
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  bool active = tid < n;
+  if (active && *(mask + tid) == 0) {
+    mean[tid] = 0.0;
+    var[tid] = 1.0;
+  }
+}
 
 static void local_stats(float *d_stage, int n, int m, double *d_mean,
                         double *d_var, int *d_mask1, int *d_mask2,
@@ -518,8 +515,8 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
                         curandStatePhilox4_32_10_t *state, int flag,
                         int blocks_x, int threads_x, int blocks_y,
                         int threads_y, cublasHandle_t cublas_handle) {
-  int *finish, unfinish = 1, *count, *temp_mask, *ones;
-  double *mean, *var, *old_mean, *old_var, *holder;
+  int *finish, unfinish = 1, *count, *mask2;
+  double *mean, *var, *old_mean, *old_var;
   unsigned long long seed = (unsigned long long)12345;
 
   checkCudaError(cudaMallocManaged((void **)&finish, n * sizeof(int)));
@@ -528,9 +525,7 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
   checkCudaError(cudaMalloc((void **)&mean, n * sizeof(double)));
   checkCudaError(cudaMalloc((void **)&var, n * sizeof(double)));
   checkCudaError(cudaMalloc((void **)&count, n * sizeof(int)));
-  checkCudaError(cudaMalloc((void **)&temp_mask, n * m * sizeof(int)));
-  checkCudaError(cudaMalloc((void **)&ones, n * sizeof(int)));
-  checkCudaError(cudaMalloc((void **)&holder, n * sizeof(double)));
+  checkCudaError(cudaMalloc((void **)&mask2, n * m * sizeof(int)));
 
   checkCudaError(cudaMemset(finish, 0, n * sizeof(int)));
   checkCudaError(cudaMemset(old_mean, 0, n * sizeof(double)));
@@ -538,21 +533,16 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
   checkCudaError(cudaMemset(mean, 0, n * sizeof(double)));
   checkCudaError(cudaMemset(var, 0, n * sizeof(double)));
   checkCudaError(cudaMemset(count, 0, n * sizeof(int)));
-  checkCudaError(cudaMemset(temp_mask, 0, n * m * sizeof(int)));
-  checkCudaError(cudaMemset(holder, 0, n * sizeof(double)));
+  checkCudaError(cudaMemset(mask2, 0, n * m * sizeof(int)));
 
-  set_int_array<<<blocks_y, threads_y>>>(ones, n,
-                                         1); // Set all channels to active
   printf("\nblocks = %d, threads = %d\n", blocks_x, threads_x);
-  set_int_array<<<blocks_x * n, threads_x /*, 0, stream[0]*/>>>(
-      temp_mask, n * m, 1); // Set all spectra to inactive
+  set_int_array<<<blocks_x * n, threads_x>>>(mask2, n * m, 1);
   checkCudaError(cudaDeviceSynchronize());
   dim3 blockDim(threads_x, 1);
 
-  // number of blocks needed in each dimension (round up)
   int grid_y_Max = 65535; // Maximum number of blocks in one dimension
   int loop = n > grid_y_Max ? (n + grid_y_Max - 1) / grid_y_Max : 1;
-  int grid_1 = n > grid_y_Max ? grid_y_Max : n; // Number of blocks in y
+  int grid_1 = n > grid_y_Max ? grid_y_Max : n;
 
   dim3 gridDim(blocks_x, grid_1);
 
@@ -574,41 +564,39 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
     checkCudaError(cudaMemset(count, 0, n * sizeof(int)));
 
     for (int i = 0; i < loop; ++i) {
-      Stats<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
-          d_stage, n, m, temp_mask, mean, var, count, finish, i * grid_y_Max);
+      LocalStatistics<<<gridDim, blockDim>>>(d_stage, n, m, mask2, mean, var,
+                                             count, finish, i * grid_y_Max);
     }
 
     Calc<<<blocks_y, threads_y>>>(mean, var, count, n);
+    Termination<<<blocks_y, threads_y>>>(mean, var, old_mean, old_var, d_mask1,
+                                         count, finish, n, round);
 
     for (int i = 0; i < loop; ++i) {
-      SigmaClip<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
-          d_stage, n, m, d_mask1, temp_mask, mean, var, old_mean, old_var,
-          count, finish, sigma_cut, round, flag, i * grid_y_Max);
+      SigmaClip<<<gridDim, blockDim>>>(d_stage, n, m, d_mask1, mask2, mean, var,
+                                       finish, sigma_cut, round, flag,
+                                       i * grid_y_Max);
     }
 
     round++;
-    // printf("Round %d: unfinish = %d\n", round, unfinish);
     checkCudaError(cudaDeviceSynchronize());
+    // printf("\nRound %d, unfinish = %d", round, unfinish);
   }
 
-  for (int i = 0; i < n; ++i) {
-    Replace<<<blocks_x, threads_x /*, 0, stream[i]*/>>>(
-        d_stage + i * m, m, d_random, mean + i, var + i, d_mask1 + i, seed,
-        finish + i, state);
+  Curand_init<<<blocks_x, threads_x>>>(state, seed, m);
+
+  for (int i = 0; i < loop; ++i) {
+    LocalReplace<<<gridDim, blockDim /*, 0, stream[i]*/>>>(
+        d_stage, n, m, d_random, mean, var, d_mask1, seed, state,
+        grid_y_Max * i);
   }
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    fprintf(stderr, "CUDA Error in Replace kernel: %s\n",
-            cudaGetErrorString(err));
-    exit(EXIT_FAILURE);
-  }
-  checkCudaError(cudaDeviceSynchronize());
+  Mask<<<blocks_x, threads_x>>>(mean, var, d_mask1, n);
 
   checkCudaError(
       cudaMemcpy(d_mean, mean, n * sizeof(double), cudaMemcpyDeviceToDevice));
   checkCudaError(
       cudaMemcpy(d_var, var, n * sizeof(double), cudaMemcpyDeviceToDevice));
-  checkCudaError(cudaMemcpy(d_mask2, temp_mask + (n - 1) * m, m * sizeof(int),
+  checkCudaError(cudaMemcpy(d_mask2, mask2 + (n - 1) * m, m * sizeof(int),
                             cudaMemcpyDeviceToDevice));
 
   checkCudaError(cudaDeviceSynchronize());
@@ -618,10 +606,10 @@ static void local_stats(float *d_stage, int n, int m, double *d_mean,
   checkCudaError(cudaFree(mean));
   checkCudaError(cudaFree(var));
   checkCudaError(cudaFree(count));
-  checkCudaError(cudaFree(temp_mask));
+  checkCudaError(cudaFree(mask2));
   checkCudaError(cudaDeviceSynchronize());
-} // namespace astroaccelerate
-// Row-major m×n input -> row-major n×m output
+}
+
 __global__ void transpose_rowmajor_kernel(const float *__restrict__ in,
                                           float *__restrict__ out, int m,
                                           int n) {
@@ -710,27 +698,22 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   float orig_mean = 0, orig_var = 0;
   cublasHandle_t handle;
   cublasCreate(&handle);
-  cublasSetPointerMode(handle,
-                       CUBLAS_POINTER_MODE_HOST); // results go to host vars
+  cublasSetPointerMode(handle, CUBLAS_POINTER_MODE_HOST);
 
-  // 1) sum of elements: dot with a vector of ones
   float *d_ones;
   cudaMalloc(&d_ones, N * sizeof(float));
-  // fill ones (kernel or thrust::fill); here’s a tiny kernel
-  fill_ones<<<(N + ThreadSize - 1) / ThreadSize, ThreadSize>>>(d_ones, N);
-  // (write your own trivial fill kernel; shown conceptually)
 
-  cublasSdot(handle, N, dev_stage, 1, d_ones, 1, &orig_mean); // Σ x_i
+  fill_ones<<<block_chan * nchans, thread_chan>>>(d_ones, N);
 
-  // 2) sum of squares
-  cublasSdot(handle, N, dev_stage, 1, dev_stage, 1, &orig_var); // Σ x_i^2
+  cublasSdot(handle, N, dev_stage, 1, d_ones, 1, &orig_mean);
+
+  cublasSdot(handle, N, dev_stage, 1, dev_stage, 1, &orig_var);
 
   orig_mean /= N;
-  orig_var = orig_var / N - orig_mean * orig_mean; // population variance
-  orig_var = sqrt(orig_var);                       // sample variance
+  orig_var = orig_var / N - orig_mean * orig_mean;
+  orig_var = sqrt(orig_var);
 
-  // Random Vectors          // number of floats (must be EVEN for normal
-  // generation)
+  // Random Vectors
   float *d_random_spectra_one, *d_random_spectra_two, *d_random_chan_one,
       *d_random_chan_two;
 
@@ -740,14 +723,13 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
       cudaMalloc((void **)&d_random_spectra_two, nchans * sizeof(int)));
   checkCudaError(cudaMalloc((void **)&d_random_chan_one, nsamp * sizeof(int)));
   checkCudaError(cudaMalloc((void **)&d_random_chan_two, nsamp * sizeof(int)));
-  // 1) Create a generator (choose a type: XORWOW, PHILOX, etc.)
+
   curandGenerator_t gen;
   CHECK_CURAND(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_PHILOX4_32_10));
   curandStatePhilox4_32_10_t *d_states;
   cudaMalloc(&d_states, max(nsamp, nchans) * sizeof(*d_states));
 
-  // 2) Seed it (change per run if you want non-reproducible)
-  unsigned long long seed = (unsigned long long)12345; // or time-based
+  unsigned long long seed = (unsigned long long)12345;
   CHECK_CURAND(curandSetPseudoRandomGeneratorSeed(gen, seed));
 
   CHECK_CURAND(curandGenerateNormal(gen, d_random_spectra_one, nchans, 0, 1));
@@ -759,14 +741,11 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
 
   int *d_chan_mask;
   checkCudaError(cudaMalloc((void **)&d_chan_mask, nchans * sizeof(int)));
-  set_int_array<<<block_chan, thread_chan>>>(d_chan_mask, nchans,
-                                             1); // Set all channels to active
+  set_int_array<<<block_chan, thread_chan>>>(d_chan_mask, nchans, 1);
 
   int *d_spectra_mask;
   checkCudaError(cudaMalloc((void **)&d_spectra_mask, nsamp * sizeof(int)));
-  set_int_array<<<block_spectra, thread_spectra>>>(
-      d_spectra_mask, nsamp,
-      1); // Set all spectra to active
+  set_int_array<<<block_spectra, thread_spectra>>>(d_spectra_mask, nsamp, 1);
 
   double *d_chan_mean;
   checkCudaError(cudaMalloc((void **)&d_chan_mean, nchans * sizeof(double)));
@@ -819,18 +798,36 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   mean_file.close();
   var_file.close();
 
-  /*  float *h_stage = (float *)malloc(N * sizeof(float));
-    checkCudaError(cudaMemcpy(h_stage, dev_stage, N * sizeof(float),
-                              cudaMemcpyDeviceToHost));
+  float *h_stage = (float *)malloc(N * sizeof(float));
+  checkCudaError(cudaMemcpy(h_stage, dev_stage, N * sizeof(float),
+                            cudaMemcpyDeviceToHost));
 
-    std::ofstream stage_file("stage_gpu.txt");
-    for (int c = 0; c < nchans; c++) {
-      for (int t = 0; t < (nsamp); t++) {
-        stage_file << (h_stage[c * (size_t)nsamp + t]) << " ";
-      }
-      stage_file << "\n";
+  /*std::ofstream stage_file("stage_gpu.txt");
+  for (int c = 0; c < nchans; c++) {
+    for (int t = 0; t < (nsamp); t++) {
+      stage_file << (h_stage[c * (size_t)nsamp + t]) << " ";
     }
-    stage_file.close();*/
+    stage_file << "\n";
+  }
+  stage_file.close();*/
+
+  std::ofstream chan_mask_file("chan_mask_gpu.txt");
+  std::vector<int> h_chan_mask(nchans);
+  checkCudaError(cudaMemcpy(h_chan_mask.data(), d_chan_mask,
+                            nchans * sizeof(int), cudaMemcpyDeviceToHost));
+  for (int c = 0; c < nchans; c++) {
+    chan_mask_file << h_chan_mask[c] << "\n";
+  }
+  chan_mask_file << "\n";
+  chan_mask_file.close();
+  std::ofstream spectra_mask_file("spectra_mask_gpu.txt");
+  std::vector<int> h_spectra_mask(nsamp);
+  checkCudaError(cudaMemcpy(h_spectra_mask.data(), d_spectra_mask,
+                            nsamp * sizeof(int), cudaMemcpyDeviceToHost));
+  for (int c = 0; c < nsamp; c++) {
+    spectra_mask_file << h_spectra_mask[c] << "\n";
+  }
+  spectra_mask_file.close();
 
   t0 = std::chrono::steady_clock::now();
 
@@ -894,17 +891,13 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
 
   dim3 block(thread_chan, min(1024 / thread_chan, thread_spectra));
   dim3 grid(block_chan, block_spectra * thread_spectra / block.y);
-  Scale<<<grid, block>>>(dev_stage, nchans, nsamp, mean_rescale,
-                         var_rescale); // Rescale the
+  Scale<<<grid, block>>>(dev_stage, nchans, nsamp, mean_rescale, var_rescale);
 
-  // data
   checkCudaError(cudaDeviceSynchronize());
   checkCudaError(
       cudaMemcpy(stage, dev_stage, N * sizeof(float), cudaMemcpyDeviceToHost));
   for (int c = 0; c < nchans; c++) {
     for (int t = 0; t < (nsamp); t++) {
-      //(*input_buffer)[c  + (size_t)nchans * t] = (unsigned char)((stage[c *
-      //(size_t)nsamp + t]*orig_var)+orig_mean);
       input_buffer[c + (size_t)nchans * t] =
           (unsigned char)(stage[c * (size_t)nsamp + t]);
     }
@@ -913,11 +906,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   FILE *fp_mask = fopen("masked_chans.txt", "w+");
   for (int c = 0; c < nchans; c++) {
     for (int t = 0; t < (nsamp) / file_reducer; t++) {
-      // fprintf(fp_mask, "%d ", (unsigned char)((stage[c *
-      (size_t) nsamp +
-          // t]*orig_var)+orig_mean));
-          fprintf(fp_mask, "%d ",
-                  (unsigned char)((stage[c * (size_t)nsamp + t])));
+      fprintf(fp_mask, "%d ", (unsigned char)((stage[c * (size_t)nsamp + t])));
     }
 
     fprintf(fp_mask, "\n");
@@ -944,7 +933,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   curandDestroyGenerator(gen);
   cublasDestroy(cublas_handle);
 
-  cudaDeviceReset(); // Reset the device to free resources
+  cudaDeviceReset();
 }
 } // namespace astroaccelerate
 
