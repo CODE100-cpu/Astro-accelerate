@@ -79,11 +79,12 @@ static __global__ void LocalStatistics(float *d_stage, int n, int m, int *mask,
   }
   __syncthreads();
 
-  extern __shared__ double ws[100];
+  __shared__ double ws_sum[32], ws_sum2[32];
+  __shared__ int ws_cnt[32];
   int warps_per_block = (blockDim.x + warpSize - 1) / warpSize;
-  double *warp_sum = ws;
-  double *warp_sum2 = ws + warps_per_block;
-  int *warp_cnt = (int *)(ws + 2 * warps_per_block);
+  double *warp_sum = ws_sum;
+  double *warp_sum2 = ws_sum2;
+  int *warp_cnt = ws_cnt;
 
   // 2) warp-level reduction, remember to put shuffle outside of guard to avoid
   // undefined behavior
@@ -94,6 +95,8 @@ static __global__ void LocalStatistics(float *d_stage, int n, int m, int *mask,
     cnt += __shfl_down_sync(-1, cnt, offset);
   }
 
+  __syncthreads();
+
   if (active && lane == 0) {
     warp_sum[wid] = sum;
     warp_sum2[wid] = sum2;
@@ -102,29 +105,33 @@ static __global__ void LocalStatistics(float *d_stage, int n, int m, int *mask,
 
   __syncthreads();
 
+  sum = 0.0;
+  sum2 = 0.0;
+  cnt = 0;
+
   // 3) block-level reduction in first warp
-  if (active && wid == 0) {
-    sum = 0.0;
-    sum2 = 0.0;
-    cnt = 0;
+  if (active && wid == 0 && lane < warps_per_block) {
+    sum = warp_sum[lane];
+    sum2 = warp_sum2[lane];
+    cnt = warp_cnt[lane];
+  }
 
-    if (lane < warps_per_block) {
-      sum = warp_sum[lane];
-      sum2 = warp_sum2[lane];
-      cnt = warp_cnt[lane];
-    }
+  __syncthreads();
+  __threadfence();
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-      sum += __shfl_down_sync(-1, sum, offset);
-      sum2 += __shfl_down_sync(-1, sum2, offset);
-      cnt += __shfl_down_sync(-1, cnt, offset);
-    }
+  for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+    sum += __shfl_down_sync(-1, sum, offset);
+    sum2 += __shfl_down_sync(-1, sum2, offset);
+    cnt += __shfl_down_sync(-1, cnt, offset);
+  }
 
-    if (lane == 0) {
-      atomicAdd(d_mean, sum);
-      atomicAdd(d_var, sum2);
-      atomicAdd(d_count, cnt);
-    }
+  __threadfence();
+  __syncthreads();
+
+  if (active && wid == 0 && lane == 0) {
+    atomicAdd(d_mean, sum);
+    atomicAdd(d_var, sum2);
+    atomicAdd(d_count, cnt);
   }
 }
 
@@ -160,11 +167,14 @@ static __global__ void GlobalStatistics(double *d_stage, int n, int *mask,
   }
 
   // Shared memory to store per-warp results
-  extern __shared__ double ws[100];
+  __shared__ double ws_sum[32], ws_sum2[32];
+  __shared__ int ws_cnt[32];
   int warps_per_block = (blockDim.x + warpSize - 1) / warpSize;
-  double *warp_sum = ws;
-  double *warp_sum2 = ws + warps_per_block;
-  int *warp_cnt = (int *)(ws + 2 * warps_per_block);
+  double *warp_sum = ws_sum;
+  double *warp_sum2 = ws_sum2;
+  int *warp_cnt = ws_cnt;
+
+  __syncthreads();
 
   if (active && lane == 0) {
     warp_sum[wid] = sum;
@@ -182,12 +192,14 @@ static __global__ void GlobalStatistics(double *d_stage, int n, int *mask,
     sum2 = warp_sum2[lane];
     cnt = warp_cnt[lane];
   }
+  __syncthreads();
 
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
     sum += __shfl_down_sync(-1, sum, offset);
     sum2 += __shfl_down_sync(-1, sum2, offset);
     cnt += __shfl_down_sync(-1, cnt, offset);
   }
+  __syncthreads();
 
   if (active && wid == 0 && lane == 0) {
     atomicAdd(d_mean, sum);
@@ -252,6 +264,8 @@ static __global__ void Termination(double *d_mean, double *d_var,
     if (count[tid] == 0) {
       finish[tid] = 1;
       mask[tid] = 0;
+      printf("\nCount zero, Sample %d %d %.16lf %.16lf", tid, round,
+             d_mean[tid], d_var[tid]);
       active = false;
     }
 
@@ -293,7 +307,6 @@ static __global__ void LocalReplace(float *d_stage, int n, int m, float *random,
     mask = mask + i;
     mean = mean + i;
     var = var + i;
-    state = state + i;
 
     if (*mask)
       d_stage[tid] = (d_stage[tid] - *mean) / *var;
@@ -341,7 +354,7 @@ GlobalConverge(double *mean, double *var, double *old_mean_of_mean,
       *old_var_of_var = *var_of_var;
     }
   }
-}
+} // namespace astroaccelerate
 
 static __global__ void Clipping(double *clipping_constant, int *mask, int n) {
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
@@ -426,6 +439,7 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
 
   unsigned long long seed = (unsigned long long)12345;
   printf("Using seed %llu\n", seed);
+  Curand_init<<<block_x, thread_x>>>(state, seed, n);
 
   while (*finish == 0) {
     checkCudaError(cudaMemset(mean_of_mean, 0, sizeof(double)));
@@ -476,6 +490,7 @@ Global_stats(float *d_stage, int n, int m, float sigma_cut, double *mean,
   GlobalReplace<<<grid, block>>>(
       d_stage, clipping_constant, mean, var, mean_of_mean, var_of_mean,
       mean_of_var, var_of_var, mask, n, m, random_one, seed, state);
+  // for here
 
   checkCudaError(cudaFree(mean_of_mean));
   checkCudaError(cudaFree(var_of_mean));
@@ -718,11 +733,13 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
       *d_random_chan_two;
 
   checkCudaError(
-      cudaMalloc((void **)&d_random_spectra_one, nchans * sizeof(int)));
+      cudaMalloc((void **)&d_random_spectra_one, nchans * sizeof(float)));
   checkCudaError(
-      cudaMalloc((void **)&d_random_spectra_two, nchans * sizeof(int)));
-  checkCudaError(cudaMalloc((void **)&d_random_chan_one, nsamp * sizeof(int)));
-  checkCudaError(cudaMalloc((void **)&d_random_chan_two, nsamp * sizeof(int)));
+      cudaMalloc((void **)&d_random_spectra_two, nchans * sizeof(float)));
+  checkCudaError(
+      cudaMalloc((void **)&d_random_chan_one, nsamp * sizeof(float)));
+  checkCudaError(
+      cudaMalloc((void **)&d_random_chan_two, nsamp * sizeof(float)));
 
   curandGenerator_t gen;
   CHECK_CURAND(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_PHILOX4_32_10));
@@ -780,9 +797,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   auto gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
   std::ofstream time_record_gpu("time_gpu.txt");
-  time_record_gpu << "Time for per channel sigma clip: " << gpu_ms
-                  << "seconds\n";
-  time_record_gpu.close();
+  time_record_gpu << "Time for per channel sigma clip: " << gpu_ms << "ms\n";
 
   double h_chan_mean[nchans], h_chan_var[nchans];
   checkCudaError(cudaMemcpy(h_chan_mean, d_chan_mean, nchans * sizeof(double),
@@ -798,36 +813,18 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   mean_file.close();
   var_file.close();
 
-  float *h_stage = (float *)malloc(N * sizeof(float));
-  checkCudaError(cudaMemcpy(h_stage, dev_stage, N * sizeof(float),
-                            cudaMemcpyDeviceToHost));
+  /*  float *h_stage = (float *)malloc(N * sizeof(float));
+    checkCudaError(cudaMemcpy(h_stage, dev_stage, N * sizeof(float),
+                              cudaMemcpyDeviceToHost));
 
-  /*std::ofstream stage_file("stage_gpu.txt");
-  for (int c = 0; c < nchans; c++) {
-    for (int t = 0; t < (nsamp); t++) {
-      stage_file << (h_stage[c * (size_t)nsamp + t]) << " ";
+    std::ofstream stage_file("stage_gpu.txt");
+    for (int c = 0; c < nchans; c++) {
+      for (int t = 0; t < (nsamp); t++) {
+        stage_file << (h_stage[c * (size_t)nsamp + t]) << " ";
+      }
+      stage_file << "\n";
     }
-    stage_file << "\n";
-  }
-  stage_file.close();*/
-
-  std::ofstream chan_mask_file("chan_mask_gpu.txt");
-  std::vector<int> h_chan_mask(nchans);
-  checkCudaError(cudaMemcpy(h_chan_mask.data(), d_chan_mask,
-                            nchans * sizeof(int), cudaMemcpyDeviceToHost));
-  for (int c = 0; c < nchans; c++) {
-    chan_mask_file << h_chan_mask[c] << "\n";
-  }
-  chan_mask_file << "\n";
-  chan_mask_file.close();
-  std::ofstream spectra_mask_file("spectra_mask_gpu.txt");
-  std::vector<int> h_spectra_mask(nsamp);
-  checkCudaError(cudaMemcpy(h_spectra_mask.data(), d_spectra_mask,
-                            nsamp * sizeof(int), cudaMemcpyDeviceToHost));
-  for (int c = 0; c < nsamp; c++) {
-    spectra_mask_file << h_spectra_mask[c] << "\n";
-  }
-  spectra_mask_file.close();
+    stage_file.close();*/
 
   t0 = std::chrono::steady_clock::now();
 
@@ -843,13 +840,13 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
 
   t1 = std::chrono::steady_clock::now();
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-  time_record_gpu << "Time for per spectra sigma clip: " << gpu_ms
-                  << " seconds\n";
+  time_record_gpu << "Time for per spectra sigma clip: " << gpu_ms << " ms\n";
   std::vector<double> h_spectra_mean(nsamp), h_spectra_var(nsamp);
   checkCudaError(cudaMemcpy(h_spectra_mean.data(), d_spectra_mean,
                             nsamp * sizeof(double), cudaMemcpyDeviceToHost));
   checkCudaError(cudaMemcpy(h_spectra_var.data(), d_spectra_var,
                             nsamp * sizeof(double), cudaMemcpyDeviceToHost));
+
   std::ofstream spectra_mean_file("spectra_mean_gpu.txt");
   std::ofstream spectra_var_file("spectra_var_gpu.txt");
   for (int c = 0; c < nsamp; c++) {
@@ -865,15 +862,16 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
 
   // Find the BLN and try to flatten the input data per spectra (remove
   // non-stationary component).
+
   std::pair<double, double> holder =
       Global_stats(dev_stage, nchans, nsamp, sigma_cut, d_chan_mean, d_chan_var,
-                   d_chan_mask, d_random_chan_two, d_states, block_chan,
-                   thread_chan, block_spectra, thread_spectra);
+                   d_chan_mask, d_random_chan_two, d_states, block_spectra,
+                   thread_spectra, block_chan, thread_chan);
 
   t1 = std::chrono::steady_clock::now();
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
   time_record_gpu << "Time for global channel sigma clip: " << gpu_ms
-                  << " seconds\n";
+                  << " ms\n";
 
   double mean_rescale = holder.first, var_rescale = holder.second;
 
@@ -881,12 +879,12 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
 
   Global_stats(dev_stage, nsamp, nchans, sigma_cut, d_spectra_mean,
                d_spectra_var, d_spectra_mask, d_random_spectra_two, d_states,
-               block_spectra, thread_spectra, block_chan, thread_chan);
+               block_chan, thread_chan, block_spectra, thread_spectra);
 
   t1 = std::chrono::steady_clock::now();
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
   time_record_gpu << "Time for global spectra sigma clip: " << gpu_ms
-                  << " seconds\n";
+                  << " ms\n";
   time_record_gpu.close();
 
   dim3 block(thread_chan, min(1024 / thread_chan, thread_spectra));
@@ -903,7 +901,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
     }
   }
 
-  FILE *fp_mask = fopen("masked_chans.txt", "w+");
+  /*FILE *fp_mask = fopen("masked_chans.txt", "w+");
   for (int c = 0; c < nchans; c++) {
     for (int t = 0; t < (nsamp) / file_reducer; t++) {
       fprintf(fp_mask, "%d ", (unsigned char)((stage[c * (size_t)nsamp + t])));
@@ -911,7 +909,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
 
     fprintf(fp_mask, "\n");
   }
-  fclose(fp_mask);
+  fclose(fp_mask);*/
 
   printf("\n%lf %lf\n", mean_rescale / orig_mean, var_rescale / orig_var);
 
@@ -947,6 +945,6 @@ int main() {
     input_buffer.push_back(value);
   }
   infile.close();
-  rfi(586071, 128, input_buffer);
+  rfi(586240, 128, input_buffer);
   return 0;
 }
