@@ -458,14 +458,16 @@ static __global__ void Scale(float *d_stage, int n, int m, float mean_rescale,
   }
 }
 
+// Mian RFI function for local RFI mitigation
+
 static void RFILocal(float *d_stage, int n, int m, double *d_mean,
                      double *d_var, int *d_mask1, int *d_mask2, float sigma_cut,
                      float *d_random, curandStatePhilox4_32_10_t *state,
                      int flag, int blocks_x, int threads_x, int blocks_y,
-                     int threads_y, cublasHandle_t cublas_handle) {
+                     int threads_y, cublasHandle_t cublas_handle,
+                     int grid_y_Max, unsigned long long seed) {
   int *finish, unfinish = 1, *count, *mask2;
   double *mean, *var, *old_mean, *old_var;
-  unsigned long long seed = (unsigned long long)12345;
 
   checkCudaError(cudaMallocManaged((void **)&finish, n * sizeof(int)));
   checkCudaError(cudaMalloc((void **)&old_mean, n * sizeof(double)));
@@ -488,7 +490,6 @@ static void RFILocal(float *d_stage, int n, int m, double *d_mean,
   checkCudaError(cudaDeviceSynchronize());
   dim3 blockDim(threads_x, 1);
 
-  int grid_y_Max = 65535; // Maximum number of blocks in one dimension
   int loop = n > grid_y_Max ? (n + grid_y_Max - 1) / grid_y_Max : 1;
   int grid_1 = n > grid_y_Max ? grid_y_Max : n;
 
@@ -558,11 +559,13 @@ static void RFILocal(float *d_stage, int n, int m, double *d_mean,
   checkCudaError(cudaDeviceSynchronize());
 }
 
-static std::pair<double, double>
-RFIGlobal(float *d_stage, int n, int m, float sigma_cut, double *mean,
-          double *var, int *mask, float *random_one,
-          curandStatePhilox4_32_10_t *state, int block_x, int thread_x,
-          int block_y, int thread_y) {
+// Main RFI function for global RFI mitigation
+static std::vector<double> RFIGlobal(float *d_stage, int n, int m,
+                                     float sigma_cut, double *mean, double *var,
+                                     int *mask, float *random_one,
+                                     curandStatePhilox4_32_10_t *state,
+                                     int block_x, int thread_x, int block_y,
+                                     int thread_y, unsigned long long seed) {
   double *mean_rescale, *var_rescale, *clipping_constant;
   checkCudaError(cudaMalloc(&clipping_constant, sizeof(double)));
   checkCudaError(cudaMemset(clipping_constant, 0, sizeof(double)));
@@ -595,9 +598,6 @@ RFIGlobal(float *d_stage, int n, int m, float sigma_cut, double *mean,
   checkCudaError(cudaMemset(old_var_of_var, 0, sizeof(double)));
 
   set_int_array<<<block_x, thread_x>>>(mask, n, 1);
-
-  unsigned long long seed = (unsigned long long)12345;
-  printf("Using seed %llu\n", seed);
   Curand_init<<<block_x, thread_x>>>(state, seed, n);
 
   while (*finish == 0) {
@@ -632,6 +632,9 @@ RFIGlobal(float *d_stage, int n, int m, float sigma_cut, double *mean,
   checkCudaError(cudaMemcpy(&h_var_of_var, var_of_var, sizeof(double),
                             cudaMemcpyDeviceToHost));
   checkCudaError(cudaDeviceSynchronize());
+
+  std::vector<double> stats = {h_mean_of_mean, h_var_of_mean, h_mean_of_var,
+                               h_var_of_var};
 
   printf("mean_of_mean = %lf\n", h_mean_of_mean);
   printf("var_of_mean  = %lf\n", h_var_of_mean);
@@ -671,9 +674,13 @@ RFIGlobal(float *d_stage, int n, int m, float sigma_cut, double *mean,
   checkCudaError(cudaFree(counter));
   checkCudaError(cudaFree(finish));
   checkCudaError(cudaFree(clipping_constant));
-  return std::pair<double, double>(h_mean_of_mean, h_mean_of_var);
+  return stats;
 }
+
+// The main RFI function called by external code
+
 void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
+
   int dev = 0;
   cudaSetDevice(dev);
   cudaDeviceProp prop;
@@ -698,7 +705,8 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
     thread_chan /= 2;
   }
 
-  int block_chan = (nsamp + thread_chan - 1) / thread_chan;
+  int block_chan =
+      (nsamp + thread_chan - 1) / thread_chan; // parameters for covering nsamp
 
   int thread_spectra = 1024;
   if (nchans >= 1024)
@@ -708,7 +716,8 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
     }
     thread_spectra /= 2;
   }
-  int block_spectra = (nchans + thread_spectra - 1) / thread_spectra;
+  int block_spectra = (nchans + thread_spectra - 1) /
+                      thread_spectra; // parameters for covering nchans
 
   float *stage = (float *)malloc(N * sizeof(float)), *dev_stage;
   unsigned short *dev_input_buffer;
@@ -808,8 +817,8 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   checkCudaError(cudaMalloc((void **)&d_spectra_var, nsamp * sizeof(double)));
   checkCudaError(cudaMemset(d_spectra_var, 0, nsamp * sizeof(double)));
 
-  // Find the BLN and try to flatten the input data per channel (remove
-  // non-stationary component).
+  // Find the BLN and try to flatten the input data per channel & spectra
+  // (remove non-stationary component).
 
   cublasHandle_t cublas_handle;
   cublasCreate(&cublas_handle);
@@ -819,7 +828,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   RFILocal(dev_stage, nchans, nsamp, d_chan_mean, d_chan_var, d_chan_mask,
            d_spectra_mask, sigma_cut, d_random_chan_one, d_states, 1,
            block_chan, thread_chan, block_spectra, thread_spectra,
-           cublas_handle);
+           cublas_handle, GridMAX_Y, seed);
 
   auto t1 = std::chrono::steady_clock::now();
   auto gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -861,7 +870,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   RFILocal(dev_stage, nsamp, nchans, d_spectra_mean, d_spectra_var,
            d_spectra_mask, d_chan_mask, sigma_cut, d_random_spectra_one,
            d_states, 0, block_spectra, thread_spectra, block_chan, thread_chan,
-           cublas_handle);
+           cublas_handle, GridMAX_Y, seed);
 
   t1 = std::chrono::steady_clock::now();
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -886,26 +895,26 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
 
   dev_stage = transpose(dev_stage, nsamp, nchans);
 
-  // Find the BLN and try to flatten the input data per spectra (remove
-  // non-stationary component).
+  // Find the BLN and try to flatten the input data per channel & spectra for
+  // global data (remove non-stationary component).
 
-  std::pair<double, double> holder =
+  std::vector<double> holder =
       RFIGlobal(dev_stage, nchans, nsamp, sigma_cut, d_chan_mean, d_chan_var,
                 d_chan_mask, d_random_chan_two, d_states, block_spectra,
-                thread_spectra, block_chan, thread_chan);
+                thread_spectra, block_chan, thread_chan, seed);
 
   t1 = std::chrono::steady_clock::now();
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
   time_record_gpu << "Time for global channel sigma clip: " << gpu_ms
                   << " ms\n";
 
-  double mean_rescale = holder.first, var_rescale = holder.second;
+  double mean_rescale = holder[0], var_rescale = holder[1];
 
   t0 = std::chrono::steady_clock::now();
 
   RFIGlobal(dev_stage, nsamp, nchans, sigma_cut, d_spectra_mean, d_spectra_var,
             d_spectra_mask, d_random_spectra_two, d_states, block_chan,
-            thread_chan, block_spectra, thread_spectra);
+            thread_chan, block_spectra, thread_spectra, seed);
 
   t1 = std::chrono::steady_clock::now();
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -920,6 +929,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   checkCudaError(cudaDeviceSynchronize());
   checkCudaError(
       cudaMemcpy(stage, dev_stage, N * sizeof(float), cudaMemcpyDeviceToHost));
+
   for (int c = 0; c < nchans; c++) {
     for (int t = 0; t < (nsamp); t++) {
       input_buffer[c + (size_t)nchans * t] =
@@ -927,7 +937,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
     }
   }
 
-  /*FILE *fp_mask = fopen("masked_chans.txt", "w+");
+  FILE *fp_mask = fopen("masked_chans.txt", "w+");
   for (int c = 0; c < nchans; c++) {
     for (int t = 0; t < (nsamp) / file_reducer; t++) {
       fprintf(fp_mask, "%d ", (unsigned char)((stage[c * (size_t)nsamp + t])));
@@ -935,7 +945,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
 
     fprintf(fp_mask, "\n");
   }
-  fclose(fp_mask);*/
+  fclose(fp_mask);
 
   printf("\n%lf %lf\n", mean_rescale / orig_mean, var_rescale / orig_var);
 
@@ -956,6 +966,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   checkCudaError(cudaFree(d_ones));
   curandDestroyGenerator(gen);
   cublasDestroy(cublas_handle);
+  checkCudaError(cudaFree(dev_input_buffer));
 
   cudaDeviceReset();
 }
