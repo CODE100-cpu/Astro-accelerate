@@ -911,6 +911,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
   time_record_gpu << "Time for global spectra sigma clip: " << gpu_ms
                   << " ms\n";
+
   time_record_gpu.close();
 
   dim3 block(thread_chan, min(1024 / thread_chan, thread_spectra));
