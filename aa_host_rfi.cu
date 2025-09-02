@@ -827,32 +827,32 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   std::ofstream time_record_gpu("time_gpu.txt");
   time_record_gpu << "Time for per channel sigma clip: " << gpu_ms << "ms\n";
 
-  double h_chan_mean[nchans], h_chan_var[nchans];
-  checkCudaError(cudaMemcpy(h_chan_mean, d_chan_mean, nchans * sizeof(double),
-                            cudaMemcpyDeviceToHost));
-  checkCudaError(cudaMemcpy(h_chan_var, d_chan_var, nchans * sizeof(double),
-                            cudaMemcpyDeviceToHost));
-  std::ofstream mean_file("chan_mean_gpu.txt");
-  std::ofstream var_file("chan_var_gpu.txt");
-  for (int c = 0; c < nchans; c++) {
-    mean_file << h_chan_mean[c] << "\n";
-    var_file << h_chan_var[c] << "\n";
-  }
-  mean_file.close();
-  var_file.close();
+  /* double h_chan_mean[nchans], h_chan_var[nchans];
+   checkCudaError(cudaMemcpy(h_chan_mean, d_chan_mean, nchans * sizeof(double),
+                             cudaMemcpyDeviceToHost));
+   checkCudaError(cudaMemcpy(h_chan_var, d_chan_var, nchans * sizeof(double),
+                             cudaMemcpyDeviceToHost));
+   std::ofstream mean_file("chan_mean_gpu.txt");
+   std::ofstream var_file("chan_var_gpu.txt");
+   for (int c = 0; c < nchans; c++) {
+     mean_file << h_chan_mean[c] << "\n";
+     var_file << h_chan_var[c] << "\n";
+   }
+   mean_file.close();
+   var_file.close();
 
-  float *h_stage = (float *)malloc(N * sizeof(float));
-  checkCudaError(cudaMemcpy(h_stage, dev_stage, N * sizeof(float),
-                            cudaMemcpyDeviceToHost));
+   float *h_stage = (float *)malloc(N * sizeof(float));
+   checkCudaError(cudaMemcpy(h_stage, dev_stage, N * sizeof(float),
+                             cudaMemcpyDeviceToHost));
 
-  std::ofstream stage_file("stage_gpu.txt");
-  for (int c = 0; c < nchans; c++) {
-    for (int t = 0; t < (nsamp); t++) {
-      stage_file << (h_stage[c * (size_t)nsamp + t]) << " ";
-    }
-    stage_file << "\n";
-  }
-  stage_file.close();
+   std::ofstream stage_file("stage_gpu.txt");
+   for (int c = 0; c < nchans; c++) {
+     for (int t = 0; t < (nsamp); t++) {
+       stage_file << (h_stage[c * (size_t)nsamp + t]) << " ";
+     }
+     stage_file << "\n";
+   }
+   stage_file.close();*/
 
   t0 = std::chrono::steady_clock::now();
 
@@ -873,14 +873,14 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   checkCudaError(cudaMemcpy(h_spectra_var.data(), d_spectra_var,
                             nsamp * sizeof(double), cudaMemcpyDeviceToHost));
 
-  std::ofstream spectra_mean_file("spectra_mean_gpu.txt");
+  /*std::ofstream spectra_mean_file("spectra_mean_gpu.txt");
   std::ofstream spectra_var_file("spectra_var_gpu.txt");
   for (int c = 0; c < nsamp; c++) {
     spectra_mean_file << h_spectra_mean[c] << "\n";
     spectra_var_file << h_spectra_var[c] << "\n";
   }
   spectra_mean_file.close();
-  spectra_var_file.close();
+  spectra_var_file.close();*/
 
   t0 = std::chrono::steady_clock::now();
 
@@ -928,7 +928,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
     }
   }
 
-  FILE *fp_mask = fopen("masked_chans.txt", "w+");
+  FILE *fp_mask = fopen("gpu_masked_chans.txt", "w+");
   for (int c = 0; c < nchans; c++) {
     for (int t = 0; t < (nsamp) / file_reducer; t++) {
       fprintf(fp_mask, "%d ", (unsigned char)((stage[c * (size_t)nsamp + t])));
