@@ -142,14 +142,6 @@ static __global__ void LocalStatistics(float *d_stage, int n, int m, int *mask,
     }
   }
   __syncthreads();
-
-  __shared__ double ws_sum[32], ws_sum2[32];
-  __shared__ int ws_cnt[32];
-  int warps_per_block = (blockDim.x + warpSize - 1) / warpSize;
-  double *warp_sum = ws_sum;
-  double *warp_sum2 = ws_sum2;
-  int *warp_cnt = ws_cnt;
-
   // 2) warp-level reduction, remember to put shuffle outside of guard to avoid
   // undefined behavior
 
@@ -161,6 +153,10 @@ static __global__ void LocalStatistics(float *d_stage, int n, int m, int *mask,
 
   __syncthreads();
 
+  __shared__ double warp_sum[32], warp_sum2[32];
+  __shared__ int warp_cnt[32];
+  int warps_per_block = (blockDim.x + warpSize - 1) / warpSize;
+
   if (active && lane == 0) {
     warp_sum[wid] = sum;
     warp_sum2[wid] = sum2;
@@ -169,33 +165,35 @@ static __global__ void LocalStatistics(float *d_stage, int n, int m, int *mask,
 
   __syncthreads();
 
-  sum = 0.0;
-  sum2 = 0.0;
-  cnt = 0;
+  int block_start = blockIdx.x * blockDim.x;
+  int valid = m - block_start;
+  valid = (valid < 0) ? 0 : (valid > blockDim.x ? blockDim.x : valid);
+  int warps_active = (valid + 31) >> 5;
+
+  double bsum = 0.0, bsum2 = 0.0;
+  int bcnt = 0;
 
   // 3) block-level reduction in first warp
-  if (active && wid == 0 && lane < warps_per_block) {
-    sum = warp_sum[lane];
-    sum2 = warp_sum2[lane];
-    cnt = warp_cnt[lane];
+  if (active && wid == 0 && lane < warps_active) {
+    bsum = warp_sum[lane];
+    bsum2 = warp_sum2[lane];
+    bcnt = warp_cnt[lane];
   }
 
   __syncthreads();
-  __threadfence();
 
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-    sum += __shfl_down_sync(-1, sum, offset);
-    sum2 += __shfl_down_sync(-1, sum2, offset);
-    cnt += __shfl_down_sync(-1, cnt, offset);
+    bsum += __shfl_down_sync(-1, bsum, offset);
+    bsum2 += __shfl_down_sync(-1, bsum2, offset);
+    bcnt += __shfl_down_sync(-1, bcnt, offset);
   }
 
-  __threadfence();
   __syncthreads();
 
   if (active && wid == 0 && lane == 0) {
-    atomicAdd(d_mean, sum);
-    atomicAdd(d_var, sum2);
-    atomicAdd(d_count, cnt);
+    atomicAdd(d_mean, bsum);
+    atomicAdd(d_var, bsum2);
+    atomicAdd(d_count, bcnt);
   }
 }
 
@@ -215,7 +213,8 @@ static __global__ void Calc(double *d_mean, double *d_var, int *count, int n) {
 // continue execute for last time
 static __global__ void Termination(double *d_mean, double *d_var,
                                    double *old_mean, double *old_var, int *mask,
-                                   int *count, int *finish, int n, int round) {
+                                   int *count, int *finish, int n, int round,
+                                   int *unfinish) {
 
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   bool active = tid < n && finish[tid] == 0;
@@ -243,6 +242,9 @@ static __global__ void Termination(double *d_mean, double *d_var,
     double oldv = old_var[tid];
     if (fabs(mean - oldm) < 1e-3 && fabs(stdv - oldv) < 1e-4 && round > 1) {
       finish[tid] = 1;
+    }
+    if (finish[tid] == 0) {
+      atomicOr(unfinish, 1);
     }
   }
 
@@ -335,16 +337,12 @@ static __global__ void GlobalStatistics(double *d_stage, int n, int *mask,
     sum2 += __shfl_down_sync(-1, sum2, offset);
     cnt += __shfl_down_sync(-1, cnt, offset);
   }
+  __syncthreads();
 
   // Shared memory to store per-warp results
-  __shared__ double ws_sum[32], ws_sum2[32];
-  __shared__ int ws_cnt[32];
+  __shared__ double warp_sum[32], warp_sum2[32];
+  __shared__ int warp_cnt[32];
   int warps_per_block = (blockDim.x + warpSize - 1) / warpSize;
-  double *warp_sum = ws_sum;
-  double *warp_sum2 = ws_sum2;
-  int *warp_cnt = ws_cnt;
-
-  __syncthreads();
 
   if (active && lane == 0) {
     warp_sum[wid] = sum;
@@ -354,27 +352,33 @@ static __global__ void GlobalStatistics(double *d_stage, int n, int *mask,
   __syncthreads();
 
   // 3) block-level reduction in first warp
-  sum = 0.0;
-  sum2 = 0.0;
-  cnt = 0;
-  if (active && wid == 0 && lane < warps_per_block) {
-    sum = warp_sum[lane];
-    sum2 = warp_sum2[lane];
-    cnt = warp_cnt[lane];
+
+  int block_start = blockIdx.x * blockDim.x;
+  int valid = n - block_start;
+  valid = (valid < 0) ? 0 : (valid > blockDim.x ? blockDim.x : valid);
+  int warps_active = (valid + 31) >> 5;
+
+  double bsum = 0.0, bsum2 = 0.0;
+  int bcnt = 0;
+
+  if (active && wid == 0 && lane < warps_active) {
+    bsum = warp_sum[lane];
+    bsum2 = warp_sum2[lane];
+    bcnt = warp_cnt[lane];
   }
   __syncthreads();
 
   for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
-    sum += __shfl_down_sync(-1, sum, offset);
-    sum2 += __shfl_down_sync(-1, sum2, offset);
-    cnt += __shfl_down_sync(-1, cnt, offset);
+    bsum += __shfl_down_sync(-1, bsum, offset);
+    bsum2 += __shfl_down_sync(-1, bsum2, offset);
+    bcnt += __shfl_down_sync(-1, bcnt, offset);
   }
   __syncthreads();
 
   if (active && wid == 0 && lane == 0) {
-    atomicAdd(d_mean, sum);
-    atomicAdd(d_var, sum2);
-    atomicAdd(d_count, cnt);
+    atomicAdd(d_mean, bsum);
+    atomicAdd(d_var, bsum2);
+    atomicAdd(d_count, bcnt);
   }
 }
 
@@ -466,10 +470,11 @@ static void RFILocal(float *d_stage, int n, int m, double *d_mean,
                      int flag, int blocks_x, int threads_x, int blocks_y,
                      int threads_y, cublasHandle_t cublas_handle,
                      int grid_y_Max, unsigned long long seed) {
-  int *finish, unfinish = 1, *count, *mask2;
+  int *finish, *unfinish, *count, *mask2;
   double *mean, *var, *old_mean, *old_var;
 
   checkCudaError(cudaMallocManaged((void **)&finish, n * sizeof(int)));
+  checkCudaError(cudaMallocManaged((void **)&unfinish, sizeof(int)));
   checkCudaError(cudaMalloc((void **)&old_mean, n * sizeof(double)));
   checkCudaError(cudaMalloc((void **)&old_var, n * sizeof(double)));
   checkCudaError(cudaMalloc((void **)&mean, n * sizeof(double)));
@@ -484,6 +489,7 @@ static void RFILocal(float *d_stage, int n, int m, double *d_mean,
   checkCudaError(cudaMemset(var, 0, n * sizeof(double)));
   checkCudaError(cudaMemset(count, 0, n * sizeof(int)));
   checkCudaError(cudaMemset(mask2, 0, n * m * sizeof(int)));
+  *unfinish = 1;
 
   printf("\nblocks = %d, threads = %d\n", blocks_x, threads_x);
   set_int_array<<<blocks_x * n, threads_x>>>(mask2, n * m, 1);
@@ -496,16 +502,9 @@ static void RFILocal(float *d_stage, int n, int m, double *d_mean,
   dim3 gridDim(blocks_x, grid_1);
 
   int round = 1;
-  while (unfinish == 1) {
+  while (*unfinish == 1) {
 
-    unfinish = 0;
-    for (int i = 0; i < n; ++i) {
-      if (finish[i] == 0) {
-        unfinish = 1;
-        break;
-      }
-    }
-
+    *unfinish = 0;
     dot<<<blocks_y, threads_y /*, 0, stream[i]*/>>>(mean, finish, n);
 
     dot<<<blocks_y, threads_y /*, 0, stream[i]*/>>>(var, finish, n);
@@ -519,7 +518,7 @@ static void RFILocal(float *d_stage, int n, int m, double *d_mean,
 
     Calc<<<blocks_y, threads_y>>>(mean, var, count, n);
     Termination<<<blocks_y, threads_y>>>(mean, var, old_mean, old_var, d_mask1,
-                                         count, finish, n, round);
+                                         count, finish, n, round, unfinish);
 
     for (int i = 0; i < loop; ++i) {
       SigmaClip<<<gridDim, blockDim>>>(d_stage, n, m, d_mask1, mask2, mean, var,
@@ -560,12 +559,11 @@ static void RFILocal(float *d_stage, int n, int m, double *d_mean,
 }
 
 // Main RFI function for global RFI mitigation
-static std::vector<double> RFIGlobal(float *d_stage, int n, int m,
-                                     float sigma_cut, double *mean, double *var,
-                                     int *mask, float *random_one,
-                                     curandStatePhilox4_32_10_t *state,
-                                     int block_x, int thread_x, int block_y,
-                                     int thread_y, unsigned long long seed) {
+static std::vector<double>
+RFIGlobal(float *d_stage, int n, int m, float sigma_cut, double *mean,
+          double *var, int *mask, float *random_one,
+          curandStatePhilox4_32_10_t *state, int block_x, int thread_x,
+          int block_y, int thread_y, unsigned long long seed, int grid_y_Max) {
   double *mean_rescale, *var_rescale, *clipping_constant;
   checkCudaError(cudaMalloc(&clipping_constant, sizeof(double)));
   checkCudaError(cudaMemset(clipping_constant, 0, sizeof(double)));
@@ -648,11 +646,11 @@ static std::vector<double> RFIGlobal(float *d_stage, int n, int m,
 
   Clipping1<<<block_x, thread_x>>>(clipping_constant, mask, n);
   Clipping2<<<1, 1>>>(n, clipping_constant);
-  dim3 block(thread_x, 1);
-  int grid_y_Max = 65535; // Maximum number of blocks in one dimension
+  dim3 block(thread_y, 1);
+
   int loop = n > grid_y_Max ? (n + grid_y_Max - 1) / grid_y_Max : 1;
   int grid_1 = n > grid_y_Max ? grid_y_Max : n;
-  dim3 grid(block_x, grid_1);
+  dim3 grid(block_y, grid_1);
 
   for (int i = 0; i < loop; ++i) {
     GlobalReplace<<<grid, block>>>(d_stage, clipping_constant, mean, var,
@@ -784,13 +782,6 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   CHECK_CURAND(curandGenerateNormal(gen, d_random_chan_one, nsamp, 0, 1));
   CHECK_CURAND(curandGenerateNormal(gen, d_random_chan_two, nsamp, 0, 1));
 
-  if (nsamp > nchans)
-    Curand_init<<<block_chan, thread_chan>>>(d_states, seed,
-                                             max(nsamp, nchans));
-  else
-    Curand_init<<<block_spectra, thread_spectra>>>(d_states, seed,
-                                                   max(nsamp, nchans));
-
   // Allocate working arrays
 
   int *d_chan_mask;
@@ -850,7 +841,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   mean_file.close();
   var_file.close();
 
-  /*float *h_stage = (float *)malloc(N * sizeof(float));
+  float *h_stage = (float *)malloc(N * sizeof(float));
   checkCudaError(cudaMemcpy(h_stage, dev_stage, N * sizeof(float),
                             cudaMemcpyDeviceToHost));
 
@@ -861,7 +852,7 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
     }
     stage_file << "\n";
   }
-  stage_file.close();*/
+  stage_file.close();
 
   t0 = std::chrono::steady_clock::now();
 
@@ -901,20 +892,20 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   std::vector<double> holder =
       RFIGlobal(dev_stage, nchans, nsamp, sigma_cut, d_chan_mean, d_chan_var,
                 d_chan_mask, d_random_chan_two, d_states, block_spectra,
-                thread_spectra, block_chan, thread_chan, seed);
+                thread_spectra, block_chan, thread_chan, seed, GridMAX_Y);
 
   t1 = std::chrono::steady_clock::now();
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
   time_record_gpu << "Time for global channel sigma clip: " << gpu_ms
                   << " ms\n";
 
-  double mean_rescale = holder[0], var_rescale = holder[1];
+  double mean_rescale = holder[0], var_rescale = holder[2];
 
   t0 = std::chrono::steady_clock::now();
 
   RFIGlobal(dev_stage, nsamp, nchans, sigma_cut, d_spectra_mean, d_spectra_var,
             d_spectra_mask, d_random_spectra_two, d_states, block_chan,
-            thread_chan, block_spectra, thread_spectra, seed);
+            thread_chan, block_spectra, thread_spectra, seed, GridMAX_Y);
 
   t1 = std::chrono::steady_clock::now();
   gpu_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -976,11 +967,13 @@ using namespace astroaccelerate;
 int main() {
   std::vector<unsigned short> input_buffer;
   std::ifstream infile("input.txt");
+  int nsamp, nchans;
+  infile >> nsamp >> nchans;
   unsigned short value;
   while (infile >> value) {
     input_buffer.push_back(value);
   }
   infile.close();
-  rfi(586240, 128, input_buffer);
+  rfi(nsamp, nchans, input_buffer);
   return 0;
 }
