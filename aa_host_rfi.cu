@@ -15,7 +15,7 @@
 //#include "aa_host_rfi.hpp"
 //#include "aa_params.hpp"
 
-// TODO LIST: auto tuning, global checking.
+// TODO LIST: auto tuning
 
 // Be aware the below code only applied for nchans or nsamp smaller than max
 // grid x dimension, which is 2147483647 for 3090 and number of channels less
@@ -936,6 +936,8 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
                   << " ms\n";
 
   time_record_gpu.close();
+
+  dev_stage = transpose(dev_stage, nsamp, nchans);
 
   dim3 block(thread_chan, min(1024 / thread_chan, thread_spectra));
   dim3 grid(block_chan,
