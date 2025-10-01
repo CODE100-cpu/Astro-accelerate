@@ -422,10 +422,10 @@ GlobalConverge(double *mean, double *var, double *old_mean_of_mean,
 }
 
 // COompute Clipping COonstants  using the below 2 functions
-static __global__ void Clipping1(double *clipping_constant, int *mask, int n) {
+static __global__ void Clipping1(double *clipping_constant, int *Mask, int n) {
   int tid = threadIdx.x + blockDim.x * blockIdx.x;
   if (tid < n)
-    atomicAdd(clipping_constant, mask[tid]);
+    atomicAdd(clipping_constant, Mask[tid]);
 }
 
 static __global__ void Clipping2(int n, double *clipping_constant) {
@@ -657,7 +657,7 @@ RFIGlobal(float *d_stage, int n, int m, float sigma_cut, double *mean,
   checkCudaError(cudaMemcpy(var_rescale, mean_of_var, sizeof(double),
                             cudaMemcpyDeviceToDevice));
 
-  Clipping1<<<block_x, thread_x>>>(clipping_constant, mask, n);
+  Clipping1<<<block_x, thread_x>>>(clipping_constant, d_mask, n);
   Clipping2<<<1, 1>>>(n, clipping_constant);
   dim3 block(thread_y, 1);
 
@@ -922,7 +922,10 @@ void rfi(int nsamp, int nchans, std::vector<unsigned short> &input_buffer) {
   time_record_gpu << "Time for global channel sigma clip: " << gpu_ms
                   << " ms\n";
   double mean_rescale = holder[0], var_rescale = holder[2];
-
+  std::ofstream stats_file("global_stats_gpu.txt");
+  stats_file << holder[0] << "\n";
+  stats_file << holder[2] << "\n";
+  stats_file.close();
   t0 = std::chrono::steady_clock::now();
   dev_stage = transpose(dev_stage, nchans, nsamp);
 
